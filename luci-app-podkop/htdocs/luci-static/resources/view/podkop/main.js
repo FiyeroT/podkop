@@ -608,6 +608,7 @@ var Podkop;
   ((AvailableMethods2) => {
     AvailableMethods2["CHECK_DNS_AVAILABLE"] = "check_dns_available";
     AvailableMethods2["CHECK_FAKEIP"] = "check_fakeip";
+    AvailableMethods2["CHECK_FAKEIP_CLIENT"] = "check_fakeip_client";
     AvailableMethods2["CHECK_NFT_RULES"] = "check_nft_rules";
     AvailableMethods2["GET_STATUS"] = "get_status";
     AvailableMethods2["CHECK_SING_BOX"] = "check_sing_box";
@@ -640,6 +641,10 @@ var PodkopShellMethods = {
   ),
   checkFakeIP: async () => callBaseMethod(
     Podkop.AvailableMethods.CHECK_FAKEIP
+  ),
+  checkFakeIPClient: async (label) => callBaseMethod(
+    Podkop.AvailableMethods.CHECK_FAKEIP_CLIENT,
+    [label]
   ),
   checkNftRules: async () => callBaseMethod(
     Podkop.AvailableMethods.CHECK_NFT_RULES
@@ -885,6 +890,7 @@ var STATUS_COLORS = {
 var PODKOP_LUCI_APP_VERSION = "__COMPILED_VERSION_VARIABLE__";
 var FAKEIP_CHECK_DOMAIN = "fakeip.podkop.fyi";
 var IP_CHECK_DOMAIN = "ip.podkop.fyi";
+var FAKEIP_CHECK_SUFFIX = "fakeipchecker.podkop.net";
 var REGIONAL_OPTIONS = [
   "russia_inside",
   "russia_outside",
@@ -1052,10 +1058,30 @@ async function getIpCheck() {
   );
 }
 
+// src/podkop/methods/fakeip/knockFakeIp.ts
+function knockFakeIp() {
+  const label = Array.from(
+    crypto.getRandomValues(new Uint8Array(10)),
+    (byte) => byte.toString(16).padStart(2, "0")
+  ).join("");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 3e3);
+  const done = fetch(`https://${label}.${FAKEIP_CHECK_SUFFIX}/`, {
+    mode: "no-cors",
+    cache: "no-store",
+    signal: controller.signal
+  }).then(
+    () => void 0,
+    () => void 0
+  ).finally(() => clearTimeout(timer));
+  return { label, done };
+}
+
 // src/podkop/methods/fakeip/index.ts
 var RemoteFakeIPMethods = {
   getFakeIpCheck,
-  getIpCheck
+  getIpCheck,
+  knockFakeIp
 };
 
 // src/podkop/services/tab.service.ts
@@ -2698,8 +2724,7 @@ async function runNftCheck() {
     state: "loading",
     items: []
   });
-  await RemoteFakeIPMethods.getFakeIpCheck();
-  await RemoteFakeIPMethods.getIpCheck();
+  await RemoteFakeIPMethods.knockFakeIp().done;
   const nftablesChecks = await PodkopShellMethods.checkNftRules();
   if (!nftablesChecks.success) {
     updateCheckStore({
@@ -2782,15 +2807,15 @@ async function runFakeIPCheck() {
     items: []
   });
   const routerFakeIPResponse = await PodkopShellMethods.checkFakeIP();
-  const checkFakeIPResponse = await RemoteFakeIPMethods.getFakeIpCheck();
-  const checkIPResponse = await RemoteFakeIPMethods.getIpCheck();
+  const { label } = RemoteFakeIPMethods.knockFakeIp();
+  const browserResponse = await PodkopShellMethods.checkFakeIPClient(label);
   const checks = {
     router: routerFakeIPResponse.success && routerFakeIPResponse.data.fakeip,
-    browserFakeIP: checkFakeIPResponse.success && checkFakeIPResponse.data.fakeip,
-    differentIP: checkFakeIPResponse.success && checkIPResponse.success && checkFakeIPResponse.data.IP !== checkIPResponse.data.IP
+    browserDNS: browserResponse.success && browserResponse.data.dns,
+    browserFakeIP: browserResponse.success && browserResponse.data.connection
   };
-  const allGood = checks.router || checks.browserFakeIP || checks.differentIP;
-  const atLeastOneGood = checks.router && checks.browserFakeIP && checks.differentIP;
+  const allGood = checks.router && checks.browserDNS && checks.browserFakeIP;
+  const atLeastOneGood = checks.router || checks.browserDNS || checks.browserFakeIP;
   const { state, description } = getMeta({ atLeastOneGood, allGood });
   updateCheckStore({
     order,
@@ -2805,17 +2830,15 @@ async function runFakeIPCheck() {
         value: ""
       },
       {
+        state: checks.browserDNS ? "success" : "error",
+        key: checks.browserDNS ? _("Browser DNS is routed through sing-box") : _("Browser DNS is not routed through sing-box"),
+        value: ""
+      },
+      {
         state: checks.browserFakeIP ? "success" : "error",
         key: checks.browserFakeIP ? _("Browser is using FakeIP correctly") : _("Browser is not using FakeIP"),
         value: ""
-      },
-      ...insertIf(checks.browserFakeIP, [
-        {
-          state: checks.differentIP ? "success" : "error",
-          key: checks.differentIP ? _("Proxy traffic is routed via FakeIP") : _("Proxy traffic is not routed via FakeIP"),
-          value: ""
-        }
-      ])
+      }
     ]
   });
 }
@@ -4388,8 +4411,8 @@ async function runChecks() {
     await runDnsCheck();
     await runSingBoxCheck();
     await runNftCheck();
-    await runSectionsCheck();
     await runFakeIPCheck();
+    await runSectionsCheck();
   } catch (e) {
     logger.error("[DIAGNOSTIC]", "runChecks - e", e);
   } finally {
@@ -4915,6 +4938,7 @@ return baseclass.extend({
   DiagnosticTab,
   ERROR_POLL_INTERVAL,
   FAKEIP_CHECK_DOMAIN,
+  FAKEIP_CHECK_SUFFIX,
   FETCH_TIMEOUT,
   IP_CHECK_DOMAIN,
   Logger,

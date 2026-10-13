@@ -10,6 +10,11 @@ export const PodkopShellMethods = {
     callBaseMethod<Podkop.FakeIPCheckResult>(
       Podkop.AvailableMethods.CHECK_FAKEIP,
     ),
+  checkFakeIPClient: async (label: string) =>
+    callBaseMethod<Podkop.FakeIPClientCheckResult>(
+      Podkop.AvailableMethods.CHECK_FAKEIP_CLIENT,
+      [label],
+    ),
   checkNftRules: async () =>
     callBaseMethod<Podkop.NftRulesCheckResult>(
       Podkop.AvailableMethods.CHECK_NFT_RULES,

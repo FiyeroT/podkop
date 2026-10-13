@@ -1,7 +1,5 @@
-import { insertIf } from '../../../../helpers';
 import { DIAGNOSTICS_CHECKS_MAP } from './contstants';
 import { PodkopShellMethods, RemoteFakeIPMethods } from '../../../methods';
-import { IDiagnosticsChecksItem } from '../../../services';
 import { updateCheckStore } from './updateCheckStore';
 import { getMeta } from '../helpers/getMeta';
 
@@ -18,22 +16,18 @@ export async function runFakeIPCheck() {
   });
 
   const routerFakeIPResponse = await PodkopShellMethods.checkFakeIP();
-  const checkFakeIPResponse = await RemoteFakeIPMethods.getFakeIpCheck();
-  const checkIPResponse = await RemoteFakeIPMethods.getIpCheck();
+  const { label } = RemoteFakeIPMethods.knockFakeIp();
+  const browserResponse = await PodkopShellMethods.checkFakeIPClient(label);
 
   const checks = {
     router: routerFakeIPResponse.success && routerFakeIPResponse.data.fakeip,
-    browserFakeIP:
-      checkFakeIPResponse.success && checkFakeIPResponse.data.fakeip,
-    differentIP:
-      checkFakeIPResponse.success &&
-      checkIPResponse.success &&
-      checkFakeIPResponse.data.IP !== checkIPResponse.data.IP,
+    browserDNS: browserResponse.success && browserResponse.data.dns,
+    browserFakeIP: browserResponse.success && browserResponse.data.connection,
   };
 
-  const allGood = checks.router || checks.browserFakeIP || checks.differentIP;
+  const allGood = checks.router && checks.browserDNS && checks.browserFakeIP;
   const atLeastOneGood =
-    checks.router && checks.browserFakeIP && checks.differentIP;
+    checks.router || checks.browserDNS || checks.browserFakeIP;
 
   const { state, description } = getMeta({ atLeastOneGood, allGood });
 
@@ -52,21 +46,19 @@ export async function runFakeIPCheck() {
         value: '',
       },
       {
+        state: checks.browserDNS ? 'success' : 'error',
+        key: checks.browserDNS
+          ? _('Browser DNS is routed through sing-box')
+          : _('Browser DNS is not routed through sing-box'),
+        value: '',
+      },
+      {
         state: checks.browserFakeIP ? 'success' : 'error',
         key: checks.browserFakeIP
           ? _('Browser is using FakeIP correctly')
           : _('Browser is not using FakeIP'),
         value: '',
       },
-      ...insertIf<IDiagnosticsChecksItem>(checks.browserFakeIP, [
-        {
-          state: checks.differentIP ? 'success' : 'error',
-          key: checks.differentIP
-            ? _('Proxy traffic is routed via FakeIP')
-            : _('Proxy traffic is not routed via FakeIP'),
-          value: '',
-        },
-      ]),
     ],
   });
 }

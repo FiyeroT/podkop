@@ -478,9 +478,11 @@ async function runChecks() {
 
     await runNftCheck();
 
-    await runSectionsCheck();
-
+    // before the outbounds: it needs none of them, and their check ends the run
+    // when no outbound responds
     await runFakeIPCheck();
+
+    await runSectionsCheck();
   } catch (e) {
     logger.error('[DIAGNOSTIC]', 'runChecks - e', e);
   } finally {

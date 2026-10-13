@@ -15,8 +15,7 @@ export async function runNftCheck() {
     items: [],
   });
 
-  await RemoteFakeIPMethods.getFakeIpCheck();
-  await RemoteFakeIPMethods.getIpCheck();
+  await RemoteFakeIPMethods.knockFakeIp().done;
 
   const nftablesChecks = await PodkopShellMethods.checkNftRules();
 

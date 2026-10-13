@@ -59,6 +59,12 @@ msgstr "Bootstrap DNS"
 msgid "Bootstrap DNS server"
 msgstr "Bootstrap DNS-сервер"
 
+msgid "Browser DNS is not routed through sing-box"
+msgstr "DNS браузера не проходит через sing-box"
+
+msgid "Browser DNS is routed through sing-box"
+msgstr "DNS браузера проходит через sing-box"
+
 msgid "Browser is not using FakeIP"
 msgstr "Браузер не использует FakeIP"
 

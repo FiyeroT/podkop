@@ -72,6 +72,14 @@ msgstr ""
 msgid "Bootstrap DNS server"
 msgstr ""
 
+#: src/podkop/tabs/diagnostic/checks/runFakeIPCheck.ts:52
+msgid "Browser DNS is not routed through sing-box"
+msgstr ""
+
+#: src/podkop/tabs/diagnostic/checks/runFakeIPCheck.ts:51
+msgid "Browser DNS is routed through sing-box"
+msgstr ""
+
 #: src/podkop/tabs/diagnostic/checks/runFakeIPCheck.ts:58
 msgid "Browser is not using FakeIP"
 msgstr ""

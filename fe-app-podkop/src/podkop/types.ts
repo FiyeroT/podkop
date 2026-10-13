@@ -51,6 +51,7 @@ export namespace Podkop {
   export enum AvailableMethods {
     CHECK_DNS_AVAILABLE = 'check_dns_available',
     CHECK_FAKEIP = 'check_fakeip',
+    CHECK_FAKEIP_CLIENT = 'check_fakeip_client',
     CHECK_NFT_RULES = 'check_nft_rules',
     GET_STATUS = 'get_status',
     CHECK_SING_BOX = 'check_sing_box',
@@ -192,6 +193,13 @@ export namespace Podkop {
   export interface FakeIPCheckResult {
     fakeip: boolean;
     IP: string;
+  }
+
+  export interface FakeIPClientCheckResult {
+    dns: boolean;
+    connection: boolean;
+    client?: string;
+    address?: string;
   }
 
   export interface GetStatus {
