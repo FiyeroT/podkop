@@ -15,9 +15,10 @@ export const PodkopShellMethods = {
       Podkop.AvailableMethods.CHECK_FAKEIP_CLIENT,
       [label],
     ),
-  checkNftRules: async () =>
+  checkNftRules: async (label: string) =>
     callBaseMethod<Podkop.NftRulesCheckResult>(
       Podkop.AvailableMethods.CHECK_NFT_RULES,
+      [label],
     ),
   getStatus: async () =>
     callBaseMethod<Podkop.GetStatus>(Podkop.AvailableMethods.GET_STATUS),

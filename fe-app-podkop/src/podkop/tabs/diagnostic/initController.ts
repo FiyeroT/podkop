@@ -11,7 +11,7 @@ import {
   renderRunAction,
   renderSystemInfo,
 } from './partials';
-import { PodkopShellMethods } from '../../methods';
+import { PodkopShellMethods, RemoteFakeIPMethods } from '../../methods';
 import { fetchServicesInfo } from '../../fetchers';
 import { normalizeCompiledVersion } from '../../../helpers/normalizeCompiledVersion';
 import { renderModal } from '../../../partials';
@@ -472,17 +472,23 @@ async function runChecks() {
       diagnosticsChecks: loadingDiagnosticsChecksStore.diagnosticsChecks,
     });
 
-    await runDnsCheck();
+    // one connection to a check name serves the nftables and the FakeIP check
+    const label = RemoteFakeIPMethods.knockFakeIp();
 
-    await runSingBoxCheck();
+    // no check needs the result of another: they run at once, each shows its own
+    const results = await Promise.allSettled([
+      runDnsCheck(),
+      runSingBoxCheck(),
+      runNftCheck(label),
+      runSectionsCheck(),
+      runFakeIPCheck(label),
+    ]);
 
-    await runNftCheck();
-
-    // before the outbounds: it needs none of them, and their check ends the run
-    // when no outbound responds
-    await runFakeIPCheck();
-
-    await runSectionsCheck();
+    results.forEach((result) => {
+      if (result.status === 'rejected') {
+        logger.error('[DIAGNOSTIC]', 'runChecks - e', result.reason);
+      }
+    });
   } catch (e) {
     logger.error('[DIAGNOSTIC]', 'runChecks - e', e);
   } finally {

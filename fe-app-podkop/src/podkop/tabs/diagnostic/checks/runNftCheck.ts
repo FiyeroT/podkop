@@ -1,9 +1,9 @@
 import { DIAGNOSTICS_CHECKS_MAP } from './contstants';
-import { RemoteFakeIPMethods, PodkopShellMethods } from '../../../methods';
+import { PodkopShellMethods } from '../../../methods';
 import { updateCheckStore } from './updateCheckStore';
 import { getMeta } from '../helpers/getMeta';
 
-export async function runNftCheck() {
+export async function runNftCheck(label: string) {
   const { order, title, code } = DIAGNOSTICS_CHECKS_MAP.NFT;
 
   updateCheckStore({
@@ -15,9 +15,7 @@ export async function runNftCheck() {
     items: [],
   });
 
-  await RemoteFakeIPMethods.knockFakeIp().done;
-
-  const nftablesChecks = await PodkopShellMethods.checkNftRules();
+  const nftablesChecks = await PodkopShellMethods.checkNftRules(label);
 
   if (!nftablesChecks.success) {
     updateCheckStore({

@@ -2,6 +2,7 @@
 "use strict";
 "require baseclass";
 "require fs";
+"require rpc";
 "require uci";
 "require ui";
 
@@ -646,8 +647,9 @@ var PodkopShellMethods = {
     Podkop.AvailableMethods.CHECK_FAKEIP_CLIENT,
     [label]
   ),
-  checkNftRules: async () => callBaseMethod(
-    Podkop.AvailableMethods.CHECK_NFT_RULES
+  checkNftRules: async (label) => callBaseMethod(
+    Podkop.AvailableMethods.CHECK_NFT_RULES,
+    [label]
   ),
   getStatus: async () => callBaseMethod(Podkop.AvailableMethods.GET_STATUS),
   checkSingBox: async () => callBaseMethod(
@@ -1066,15 +1068,12 @@ function knockFakeIp() {
   ).join("");
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3e3);
-  const done = fetch(`https://${label}.${FAKEIP_CHECK_SUFFIX}/`, {
+  fetch(`https://${label}.${FAKEIP_CHECK_SUFFIX}/`, {
     mode: "no-cors",
     cache: "no-store",
     signal: controller.signal
-  }).then(
-    () => void 0,
-    () => void 0
-  ).finally(() => clearTimeout(timer));
-  return { label, done };
+  }).catch(() => void 0).finally(() => clearTimeout(timer));
+  return label;
 }
 
 // src/podkop/methods/fakeip/index.ts
@@ -2714,7 +2713,7 @@ async function runSingBoxCheck() {
 }
 
 // src/podkop/tabs/diagnostic/checks/runNftCheck.ts
-async function runNftCheck() {
+async function runNftCheck(label) {
   const { order, title, code } = DIAGNOSTICS_CHECKS_MAP.NFT;
   updateCheckStore({
     order,
@@ -2724,8 +2723,7 @@ async function runNftCheck() {
     state: "loading",
     items: []
   });
-  await RemoteFakeIPMethods.knockFakeIp().done;
-  const nftablesChecks = await PodkopShellMethods.checkNftRules();
+  const nftablesChecks = await PodkopShellMethods.checkNftRules(label);
   if (!nftablesChecks.success) {
     updateCheckStore({
       order,
@@ -2796,7 +2794,7 @@ async function runNftCheck() {
 }
 
 // src/podkop/tabs/diagnostic/checks/runFakeIPCheck.ts
-async function runFakeIPCheck() {
+async function runFakeIPCheck(label) {
   const { order, title, code } = DIAGNOSTICS_CHECKS_MAP.FAKEIP;
   updateCheckStore({
     order,
@@ -2806,9 +2804,10 @@ async function runFakeIPCheck() {
     state: "loading",
     items: []
   });
-  const routerFakeIPResponse = await PodkopShellMethods.checkFakeIP();
-  const { label } = RemoteFakeIPMethods.knockFakeIp();
-  const browserResponse = await PodkopShellMethods.checkFakeIPClient(label);
+  const [routerFakeIPResponse, browserResponse] = await Promise.all([
+    PodkopShellMethods.checkFakeIP(),
+    PodkopShellMethods.checkFakeIPClient(label)
+  ]);
   const checks = {
     router: routerFakeIPResponse.success && routerFakeIPResponse.data.fakeip,
     browserDNS: browserResponse.success && browserResponse.data.dns,
@@ -4408,11 +4407,19 @@ async function runChecks() {
       diagnosticsRunAction: { loading: true },
       diagnosticsChecks: loadingDiagnosticsChecksStore.diagnosticsChecks
     });
-    await runDnsCheck();
-    await runSingBoxCheck();
-    await runNftCheck();
-    await runFakeIPCheck();
-    await runSectionsCheck();
+    const label = RemoteFakeIPMethods.knockFakeIp();
+    const results = await Promise.allSettled([
+      runDnsCheck(),
+      runSingBoxCheck(),
+      runNftCheck(label),
+      runSectionsCheck(),
+      runFakeIPCheck(label)
+    ]);
+    results.forEach((result) => {
+      if (result.status === "rejected") {
+        logger.error("[DIAGNOSTIC]", "runChecks - e", result.reason);
+      }
+    });
   } catch (e) {
     logger.error("[DIAGNOSTIC]", "runChecks - e", e);
   } finally {
@@ -4812,6 +4819,20 @@ async function withTimeout(promise, timeoutMs, operationName, timeoutMessage = _
 }
 
 // src/helpers/executeShellCommand.ts
+var executeFile;
+async function execute(command, args) {
+  executeFile ?? (executeFile = rpc.declare({
+    object: "file",
+    method: "exec",
+    params: ["command", "params", "env"],
+    nobatch: true
+  }));
+  const reply = await executeFile(command, args);
+  if (typeof reply !== "object" || reply === null) {
+    throw new Error(`${command}: rpc error ${reply}`);
+  }
+  return reply;
+}
 async function executeShellCommand({
   command,
   args,
@@ -4819,7 +4840,7 @@ async function executeShellCommand({
 }) {
   try {
     return withTimeout(
-      fs.exec(command, args),
+      execute(command, args),
       timeout,
       [command, ...args].join(" ")
     );

@@ -1,9 +1,9 @@
 import { DIAGNOSTICS_CHECKS_MAP } from './contstants';
-import { PodkopShellMethods, RemoteFakeIPMethods } from '../../../methods';
+import { PodkopShellMethods } from '../../../methods';
 import { updateCheckStore } from './updateCheckStore';
 import { getMeta } from '../helpers/getMeta';
 
-export async function runFakeIPCheck() {
+export async function runFakeIPCheck(label: string) {
   const { order, title, code } = DIAGNOSTICS_CHECKS_MAP.FAKEIP;
 
   updateCheckStore({
@@ -15,9 +15,10 @@ export async function runFakeIPCheck() {
     items: [],
   });
 
-  const routerFakeIPResponse = await PodkopShellMethods.checkFakeIP();
-  const { label } = RemoteFakeIPMethods.knockFakeIp();
-  const browserResponse = await PodkopShellMethods.checkFakeIPClient(label);
+  const [routerFakeIPResponse, browserResponse] = await Promise.all([
+    PodkopShellMethods.checkFakeIP(),
+    PodkopShellMethods.checkFakeIPClient(label),
+  ]);
 
   const checks = {
     router: routerFakeIPResponse.success && routerFakeIPResponse.data.fakeip,
