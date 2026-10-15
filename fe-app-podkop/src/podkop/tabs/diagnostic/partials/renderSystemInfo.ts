@@ -37,10 +37,10 @@ export function renderSystemInfo({ items }: IRenderSystemInfoProps) {
         'div',
         { class: 'pdk_diagnostic-page__right-bar__system-info__row' },
         [
-          E('b', {}, item.key),
+          E('b', {}, [item.key]),
           E('div', {}, [
-            E('span', {}, item.value),
-            E('span', { class: tagClass }, item?.tag?.label),
+            E('span', {}, [item.value]),
+            E('span', { class: tagClass }, [item?.tag?.label ?? '']),
           ]),
         ],
       );

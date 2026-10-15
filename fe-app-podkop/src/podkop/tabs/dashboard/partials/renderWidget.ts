@@ -37,11 +37,9 @@ function renderLoadingState() {
 
 function renderDefaultState({ title, items }: IRenderWidgetProps) {
   return E('div', { class: 'pdk_dashboard-page__widgets-section__item' }, [
-    E(
-      'b',
-      { class: 'pdk_dashboard-page__widgets-section__item__title' },
+    E('b', { class: 'pdk_dashboard-page__widgets-section__item__title' }, [
       title,
-    ),
+    ]),
     ...items.map((item) =>
       E(
         'div',
@@ -52,12 +50,12 @@ function renderDefaultState({ title, items }: IRenderWidgetProps) {
           E(
             'span',
             { class: 'pdk_dashboard-page__widgets-section__item__row__key' },
-            `${item.key}: `,
+            [`${item.key}: `],
           ),
           E(
             'span',
             { class: 'pdk_dashboard-page__widgets-section__item__row__value' },
-            item.value,
+            [item.value],
           ),
         ],
       ),

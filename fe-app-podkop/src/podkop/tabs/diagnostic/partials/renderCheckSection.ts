@@ -43,7 +43,7 @@ function renderCheckSummary(items: IRenderCheckSectionProps['items']) {
       {
         class: `pdk_diagnostic_alert__summary__item pdk_diagnostic_alert__summary__item--${item.state}`,
       },
-      [getIcon(), E('b', {}, item.key), E('div', {}, item.value)],
+      [getIcon(), E('b', {}, [item.key]), E('div', {}, [item.value])],
     );
   });
 
@@ -60,12 +60,10 @@ function renderLoadingState(props: IRenderCheckSectionProps) {
     [
       iconWrap,
       E('div', { class: 'pdk_diagnostic_alert__content' }, [
-        E('b', { class: 'pdk_diagnostic_alert__title' }, props.title),
-        E(
-          'div',
-          { class: 'pdk_diagnostic_alert__description' },
+        E('b', { class: 'pdk_diagnostic_alert__title' }, [props.title]),
+        E('div', { class: 'pdk_diagnostic_alert__description' }, [
           props.description,
-        ),
+        ]),
       ]),
       E('div', {}, ''),
       renderCheckSummary(props.items),
@@ -83,12 +81,10 @@ function renderWarningState(props: IRenderCheckSectionProps) {
     [
       iconWrap,
       E('div', { class: 'pdk_diagnostic_alert__content' }, [
-        E('b', { class: 'pdk_diagnostic_alert__title' }, props.title),
-        E(
-          'div',
-          { class: 'pdk_diagnostic_alert__description' },
+        E('b', { class: 'pdk_diagnostic_alert__title' }, [props.title]),
+        E('div', { class: 'pdk_diagnostic_alert__description' }, [
           props.description,
-        ),
+        ]),
       ]),
       E('div', {}, ''),
       renderCheckSummary(props.items),
@@ -106,12 +102,10 @@ function renderErrorState(props: IRenderCheckSectionProps) {
     [
       iconWrap,
       E('div', { class: 'pdk_diagnostic_alert__content' }, [
-        E('b', { class: 'pdk_diagnostic_alert__title' }, props.title),
-        E(
-          'div',
-          { class: 'pdk_diagnostic_alert__description' },
+        E('b', { class: 'pdk_diagnostic_alert__title' }, [props.title]),
+        E('div', { class: 'pdk_diagnostic_alert__description' }, [
           props.description,
-        ),
+        ]),
       ]),
       E('div', {}, ''),
       renderCheckSummary(props.items),
@@ -129,12 +123,10 @@ function renderSuccessState(props: IRenderCheckSectionProps) {
     [
       iconWrap,
       E('div', { class: 'pdk_diagnostic_alert__content' }, [
-        E('b', { class: 'pdk_diagnostic_alert__title' }, props.title),
-        E(
-          'div',
-          { class: 'pdk_diagnostic_alert__description' },
+        E('b', { class: 'pdk_diagnostic_alert__title' }, [props.title]),
+        E('div', { class: 'pdk_diagnostic_alert__description' }, [
           props.description,
-        ),
+        ]),
       ]),
       E('div', {}, ''),
       renderCheckSummary(props.items),
@@ -152,12 +144,10 @@ function renderSkippedState(props: IRenderCheckSectionProps) {
     [
       iconWrap,
       E('div', { class: 'pdk_diagnostic_alert__content' }, [
-        E('b', { class: 'pdk_diagnostic_alert__title' }, props.title),
-        E(
-          'div',
-          { class: 'pdk_diagnostic_alert__description' },
+        E('b', { class: 'pdk_diagnostic_alert__title' }, [props.title]),
+        E('div', { class: 'pdk_diagnostic_alert__description' }, [
           props.description,
-        ),
+        ]),
       ]),
       E('div', {}, ''),
       renderCheckSummary(props.items),

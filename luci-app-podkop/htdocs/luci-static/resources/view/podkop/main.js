@@ -1618,7 +1618,7 @@ function coreService() {
       intervalMs: 3e3,
       onNewLog: (line) => {
         if (line.toLowerCase().includes("[error]") || line.toLowerCase().includes("[fatal]")) {
-          ui.addNotification("Podkop Error", E("div", {}, line), "error");
+          ui.addNotification("Podkop Error", E("div", {}, [line]), "error");
         }
       }
     }
@@ -1817,18 +1817,14 @@ function renderDefaultState({
         click: () => section.withTagSelect && onChooseOutbound(section.code, outbound.code)
       },
       [
-        E("b", {}, outbound.displayName),
+        E("b", {}, [outbound.displayName]),
         E("div", { class: "pdk_dashboard-page__outbound-grid__item__footer" }, [
-          E(
-            "div",
-            { class: "pdk_dashboard-page__outbound-grid__item__type" },
+          E("div", { class: "pdk_dashboard-page__outbound-grid__item__type" }, [
             outbound.type
-          ),
-          E(
-            "div",
-            { class: getLatencyClass() },
+          ]),
+          E("div", { class: getLatencyClass() }, [
             outbound.latency ? `${outbound.latency}ms` : "N/A"
-          )
+          ])
         ])
       ]
     );
@@ -1841,7 +1837,7 @@ function renderDefaultState({
         {
           class: "pdk_dashboard-page__outbound-section__title-section__title"
         },
-        section.displayName
+        [section.displayName]
       ),
       latencyFetching ? E("div", { class: "skeleton", style: "width: 99px; height: 28px" }) : E(
         "button",
@@ -1894,11 +1890,9 @@ function renderLoadingState2() {
 }
 function renderDefaultState2({ title, items }) {
   return E("div", { class: "pdk_dashboard-page__widgets-section__item" }, [
-    E(
-      "b",
-      { class: "pdk_dashboard-page__widgets-section__item__title" },
+    E("b", { class: "pdk_dashboard-page__widgets-section__item__title" }, [
       title
-    ),
+    ]),
     ...items.map(
       (item) => E(
         "div",
@@ -1909,12 +1903,12 @@ function renderDefaultState2({ title, items }) {
           E(
             "span",
             { class: "pdk_dashboard-page__widgets-section__item__row__key" },
-            `${item.key}: `
+            [`${item.key}: `]
           ),
           E(
             "span",
             { class: "pdk_dashboard-page__widgets-section__item__row__value" },
-            item.value
+            [item.value]
           )
         ]
       )
@@ -3457,7 +3451,7 @@ function renderButton({
   return E(
     "button",
     { class: getClass(), disabled: getDisabled(), click: onClick },
-    [...insertIf(hasIcon, [getWrappedIcon()]), E("span", {}, text)]
+    [...insertIf(hasIcon, [getWrappedIcon()]), E("span", {}, [text])]
   );
 }
 
@@ -3502,7 +3496,7 @@ function renderModal(text, name) {
     "div",
     { class: "pdk-partial-modal__body" },
     E("div", {}, [
-      E("pre", { class: "pdk-partial-modal__content" }, E("code", {}, text)),
+      E("pre", { class: "pdk-partial-modal__content" }, E("code", {}, [text])),
       E("div", { class: "pdk-partial-modal__footer" }, [
         renderButton({
           classNames: ["cbi-button-apply"],
@@ -3651,7 +3645,7 @@ function renderCheckSummary(items) {
       {
         class: `pdk_diagnostic_alert__summary__item pdk_diagnostic_alert__summary__item--${item.state}`
       },
-      [getIcon(), E("b", {}, item.key), E("div", {}, item.value)]
+      [getIcon(), E("b", {}, [item.key]), E("div", {}, [item.value])]
     );
   });
   return E("div", { class: "pdk_diagnostic_alert__summary" }, renderedItems);
@@ -3665,12 +3659,10 @@ function renderLoadingState3(props) {
     [
       iconWrap,
       E("div", { class: "pdk_diagnostic_alert__content" }, [
-        E("b", { class: "pdk_diagnostic_alert__title" }, props.title),
-        E(
-          "div",
-          { class: "pdk_diagnostic_alert__description" },
+        E("b", { class: "pdk_diagnostic_alert__title" }, [props.title]),
+        E("div", { class: "pdk_diagnostic_alert__description" }, [
           props.description
-        )
+        ])
       ]),
       E("div", {}, ""),
       renderCheckSummary(props.items)
@@ -3686,12 +3678,10 @@ function renderWarningState(props) {
     [
       iconWrap,
       E("div", { class: "pdk_diagnostic_alert__content" }, [
-        E("b", { class: "pdk_diagnostic_alert__title" }, props.title),
-        E(
-          "div",
-          { class: "pdk_diagnostic_alert__description" },
+        E("b", { class: "pdk_diagnostic_alert__title" }, [props.title]),
+        E("div", { class: "pdk_diagnostic_alert__description" }, [
           props.description
-        )
+        ])
       ]),
       E("div", {}, ""),
       renderCheckSummary(props.items)
@@ -3707,12 +3697,10 @@ function renderErrorState(props) {
     [
       iconWrap,
       E("div", { class: "pdk_diagnostic_alert__content" }, [
-        E("b", { class: "pdk_diagnostic_alert__title" }, props.title),
-        E(
-          "div",
-          { class: "pdk_diagnostic_alert__description" },
+        E("b", { class: "pdk_diagnostic_alert__title" }, [props.title]),
+        E("div", { class: "pdk_diagnostic_alert__description" }, [
           props.description
-        )
+        ])
       ]),
       E("div", {}, ""),
       renderCheckSummary(props.items)
@@ -3728,12 +3716,10 @@ function renderSuccessState(props) {
     [
       iconWrap,
       E("div", { class: "pdk_diagnostic_alert__content" }, [
-        E("b", { class: "pdk_diagnostic_alert__title" }, props.title),
-        E(
-          "div",
-          { class: "pdk_diagnostic_alert__description" },
+        E("b", { class: "pdk_diagnostic_alert__title" }, [props.title]),
+        E("div", { class: "pdk_diagnostic_alert__description" }, [
           props.description
-        )
+        ])
       ]),
       E("div", {}, ""),
       renderCheckSummary(props.items)
@@ -3749,12 +3735,10 @@ function renderSkippedState(props) {
     [
       iconWrap,
       E("div", { class: "pdk_diagnostic_alert__content" }, [
-        E("b", { class: "pdk_diagnostic_alert__title" }, props.title),
-        E(
-          "div",
-          { class: "pdk_diagnostic_alert__description" },
+        E("b", { class: "pdk_diagnostic_alert__title" }, [props.title]),
+        E("div", { class: "pdk_diagnostic_alert__description" }, [
           props.description
-        )
+        ])
       ]),
       E("div", {}, ""),
       renderCheckSummary(props.items)
@@ -3818,10 +3802,10 @@ function renderSystemInfo({ items }) {
         "div",
         { class: "pdk_diagnostic-page__right-bar__system-info__row" },
         [
-          E("b", {}, item.key),
+          E("b", {}, [item.key]),
           E("div", {}, [
-            E("span", {}, item.value),
-            E("span", { class: tagClass }, item?.tag?.label)
+            E("span", {}, [item.value]),
+            E("span", { class: tagClass }, [item?.tag?.label ?? ""])
           ])
         ]
       );

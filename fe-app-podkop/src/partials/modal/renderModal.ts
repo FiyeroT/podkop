@@ -7,7 +7,7 @@ export function renderModal(text: string, name: string) {
     'div',
     { class: 'pdk-partial-modal__body' },
     E('div', {}, [
-      E('pre', { class: 'pdk-partial-modal__content' }, E('code', {}, text)),
+      E('pre', { class: 'pdk-partial-modal__content' }, E('code', {}, [text])),
 
       E('div', { class: 'pdk-partial-modal__footer' }, [
         renderButton({

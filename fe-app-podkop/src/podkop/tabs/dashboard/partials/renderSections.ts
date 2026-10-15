@@ -70,18 +70,14 @@ export function renderDefaultState({
           onChooseOutbound(section.code, outbound.code),
       },
       [
-        E('b', {}, outbound.displayName),
+        E('b', {}, [outbound.displayName]),
         E('div', { class: 'pdk_dashboard-page__outbound-grid__item__footer' }, [
-          E(
-            'div',
-            { class: 'pdk_dashboard-page__outbound-grid__item__type' },
+          E('div', { class: 'pdk_dashboard-page__outbound-grid__item__type' }, [
             outbound.type,
-          ),
-          E(
-            'div',
-            { class: getLatencyClass() },
+          ]),
+          E('div', { class: getLatencyClass() }, [
             outbound.latency ? `${outbound.latency}ms` : 'N/A',
-          ),
+          ]),
         ]),
       ],
     );
@@ -95,7 +91,7 @@ export function renderDefaultState({
         {
           class: 'pdk_dashboard-page__outbound-section__title-section__title',
         },
-        section.displayName,
+        [section.displayName],
       ),
       latencyFetching
         ? E('div', { class: 'skeleton', style: 'width: 99px; height: 28px' })
