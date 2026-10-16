@@ -701,6 +701,10 @@ var PodkopShellMethods = {
   ),
   globalCheck: async () => callBaseMethod(Podkop.AvailableMethods.GLOBAL_CHECK),
   showSingBoxConfig: async () => callBaseMethod(Podkop.AvailableMethods.SHOW_SING_BOX_CONFIG),
+  checkLogsSince: async (cursor) => callBaseMethod(Podkop.AvailableMethods.CHECK_LOGS, [
+    "--since",
+    cursor
+  ]),
   checkLogs: async () => callBaseMethod(Podkop.AvailableMethods.CHECK_LOGS),
   getSystemInfo: async () => callBaseMethod(
     Podkop.AvailableMethods.GET_SYSTEM_INFO
@@ -1606,11 +1610,24 @@ function coreService() {
     });
   });
   const watcher = PodkopLogWatcher.getInstance();
+  const cursorKey = "podkop-log-cursor";
   watcher.init(
     async () => {
-      const logs = await PodkopShellMethods.checkLogs();
-      if (logs.success) {
-        return logs.data;
+      let cursor = "";
+      try {
+        cursor = sessionStorage.getItem(cursorKey) ?? "";
+      } catch {
+      }
+      const logs = await PodkopShellMethods.checkLogsSince(cursor);
+      if (logs.success && Array.isArray(logs.data?.lines)) {
+        try {
+          sessionStorage.setItem(
+            cursorKey,
+            `${logs.data.run}:${logs.data.next}`
+          );
+        } catch {
+        }
+        return logs.data.lines.join("\n");
       }
       return "";
     },

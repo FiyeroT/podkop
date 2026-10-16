@@ -84,6 +84,11 @@ export const PodkopShellMethods = {
     callBaseMethod<unknown>(Podkop.AvailableMethods.GLOBAL_CHECK),
   showSingBoxConfig: async () =>
     callBaseMethod<unknown>(Podkop.AvailableMethods.SHOW_SING_BOX_CONFIG),
+  checkLogsSince: async (cursor: string) =>
+    callBaseMethod<Podkop.LogsSince>(Podkop.AvailableMethods.CHECK_LOGS, [
+      '--since',
+      cursor,
+    ]),
   checkLogs: async () =>
     callBaseMethod<unknown>(Podkop.AvailableMethods.CHECK_LOGS),
   getSystemInfo: async () =>
