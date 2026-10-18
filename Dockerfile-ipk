@@ -2,7 +2,11 @@ FROM itdoginfo/openwrt-sdk-ipk:24.10.6
 
 ARG PODKOP_VERSION
 
+COPY ./sdk/golang-feed.sh /builder/golang-feed.sh
+RUN sh /builder/golang-feed.sh
+
 COPY ./podkop /builder/package/feeds/utilities/podkop
+COPY ./src/backend /builder/package/feeds/utilities/podkop/src/backend
 COPY ./luci-app-podkop /builder/package/feeds/luci/luci-app-podkop
 
 RUN export PODKOP_VERSION="v${PODKOP_VERSION}" && \

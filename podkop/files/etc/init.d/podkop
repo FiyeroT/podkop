@@ -1,52 +1,77 @@
 #!/bin/sh /etc/rc.common
-# shellcheck disable=SC2034,SC2154
-
+# The service of the backend of podkop (src/backend), sing-box inside it.
 START=99
 USE_PROCD=1
 
-script=$(readlink "$initscript")
-NAME="$(basename ${script:-$initscript})"
-config_load "$NAME"
-
 start_service() {
-    echo "Start podkop"
-
-    config_get enable_badwan_interface_monitoring "settings" "enable_badwan_interface_monitoring"
-    config_get badwan_monitored_interfaces "settings" "badwan_monitored_interfaces"
-
-    procd_open_instance
-    procd_set_param command /usr/bin/podkop start
-    [ "$enable_badwan_interface_monitoring" = "1" ] && [ -n "$badwan_monitored_interfaces" ] &&
-        procd_set_param netdev "$badwan_monitored_interfaces"
+    procd_open_instance main
+    procd_set_param command /usr/bin/podkop daemon
     procd_set_param stdout 1
     procd_set_param stderr 1
+    # A backend that crashes is started again after 5 s. After the fifth crash in a row that
+    # came less than 10 minutes after its start, procd gives up and reports instance.fail;
+    # the guard (service podkop-guard) then gives the LAN the router's own DNS back. A
+    # backend started again forever would leave the LAN asking a DNS that is never there.
+    procd_set_param respawn 600 5 5
+    # the backend raises the limit itself as well: an init script kept from another package
+    # would not set it
+    procd_set_param limits nofile="65536 65536"
+    procd_set_param term_timeout 30
+    local env="" dns_fallback memory_limit
+    config_load podkop
+    # when a DNS server reached directly through the WAN fails, answer from the provider's
+    # DNS (sing-box takes it from netifd over ubus); podkop.settings.dns_fallback=0 turns
+    # it off
+    config_get_bool dns_fallback settings dns_fallback 1
+    [ "$dns_fallback" -eq 1 ] && env="SING_BOX_DNS_FALLBACK=ubus"
+    # sing-box keeps the Go memory limit at the memory the system can still give; a size
+    # here (such as 64MiB) replaces it, off removes it. Go stops at start on a malformed
+    # GOMEMLIMIT, so a value it would not take is left out (seven digits at most), and so is
+    # a number without a unit, which Go reads as bytes, and zero
+    config_get memory_limit settings memory_limit
+    if [ -n "$memory_limit" ]; then
+        if printf '%s' "$memory_limit" | tr '\n' ' ' | grep -qE '^(off|[1-9][0-9]{0,6}(MiB|GiB))$'; then
+            env="$env GOMEMLIMIT=$memory_limit"
+        else
+            logger -t podkop "memory_limit '$memory_limit' ignored: use off or a size in MiB or GiB, such as 64MiB"
+        fi
+    fi
+    [ -n "$env" ] && procd_set_param env $env
     procd_close_instance
 }
 
-stop_service() {
-    /usr/bin/podkop stop
-}
-
+# a change of the settings is applied by the running backend: nothing is restarted
 reload_service() {
-    /usr/bin/podkop reload > /dev/null 2>&1
+    procd_send_signal podkop
 }
 
 service_triggers() {
-    echo "service_triggers start"
+    procd_add_reload_trigger "podkop"
+}
 
-    config_get enable_badwan_interface_monitoring "settings" "enable_badwan_interface_monitoring"
-    config_get badwan_monitored_interfaces "settings" "badwan_monitored_interfaces"
-    config_get badwan_reload_delay "settings" "badwan_reload_delay" "2000"
+# After every stop, also the stop of a backend that was dead already: what it left taken
+# is given back. The command waits for a backend that is still ending.
+service_stopped() {
+    /usr/bin/podkop release
+}
 
-    PROCD_RELOAD_DELAY=$badwan_reload_delay
-
-    procd_open_trigger
-    procd_add_config_trigger "config.change" "$NAME" "$initscript" restart 'on_config_change'
-
-    if [ "$enable_badwan_interface_monitoring" = "1" ]; then
-        for iface in $badwan_monitored_interfaces; do
-            procd_add_interface_trigger "interface.*.up" "$iface" /etc/init.d/podkop reload
-        done
-    fi
-    procd_close_trigger
+# After a Start or a Restart, not after the start at boot (which must not be held): wait
+# until the backend has come up, or has given the router back, at most 20 s. The user
+# interface asks the state of the service once, 5 s after its button returns: a start
+# that took longer left the buttons of a stopped service on the page.
+service_started() {
+    [ "$action" = boot ] && return 0
+    local i=0 pid state
+    while [ $i -lt 20 ]; do
+        pid=$(ubus call service list '{"name":"podkop"}' 2>/dev/null | jsonfilter -e '@.podkop.instances.main.pid' 2>/dev/null)
+        state=$(cat /var/run/podkop/state 2>/dev/null)
+        if [ -n "$pid" ]; then
+            case "$state" in
+            "running $pid "* | "released $pid "*) return 0 ;;
+            esac
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 0
 }

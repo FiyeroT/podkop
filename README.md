@@ -40,9 +40,9 @@ https://podkop.net/
 sh <(wget -O - https://raw.githubusercontent.com/itdoginfo/podkop/refs/heads/main/install.sh)
 ```
 
-Часть возможностей Podkop (например, ссылки с транспортом xhttp и резервные ссылки в URLTest) работает только с альтернативной сборкой sing-box — [podkop-engine](https://github.com/FiyeroT/podkop-engine) версии r11 или новее. С обычным sing-box эти возможности недоступны, остальное работает как раньше.
+С версии 0.8 sing-box входит в Podkop: пакет podkop содержит [podkop-engine](https://github.com/FiyeroT/podkop-engine) — сборку sing-box с исправлениями и возможностями для Podkop (ссылки с транспортом xhttp, резервные ссылки в URLTest и другие). Отдельный пакет sing-box не нужен: установщик заменяет его, а команда `sing-box` на роутере остаётся.
 
-Установить podkop-engine можно из его [репозитория](https://github.com/FiyeroT/podkop-engine/releases) или альтернативным скриптом, который ставит последние версии Podkop и podkop-engine:
+Альтернативный скрипт установки:
 ```
 wget -O - https://mirror.podkop.net/urjw/scripts/bootstrap.sh | sh
 ```

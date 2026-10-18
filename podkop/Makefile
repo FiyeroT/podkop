@@ -7,58 +7,107 @@ PKG_VERSION := $(if $(PODKOP_VERSION),$(PODKOP_VERSION),0.$(shell date +%d%m%Y))
 PKG_RELEASE:=1
 
 PKG_MAINTAINER:=ITDog <podkop@itdog.info>
-PKG_LICENSE:=GPL-2.0-or-later
+# the backend is GPL-2.0-or-later; the binary links sing-box (podkop-engine), which is
+# GPL-3.0-or-later
+PKG_LICENSE:=GPL-2.0-or-later GPL-3.0-or-later
+
+PKG_BUILD_DEPENDS:=golang/host
+PKG_BUILD_PARALLEL:=1
+PKG_BUILD_FLAGS:=no-mips16
+
+# The backend, src/backend of this repository: next to this directory in a checkout, or
+# copied into it (src/backend) where the package is built alone.
+BACKEND_DIR:=$(firstword $(wildcard $(CURDIR)/src/backend $(CURDIR)/../src/backend))
+
+GO_PKG:=github.com/itdoginfo/podkop/src/backend
+GO_PKG_BUILD_PKG:=$(GO_PKG)/cmd/podkop
+# the tags podkop-engine is built with; the commands of the lab (tag lab) are not in the
+# package
+GO_PKG_TAGS:=with_quic,with_utls,with_clash_api,podkop_slim,badlinkname,tfogo_checklinkname0
+GO_PKG_LDFLAGS:=-checklinkname=0
+# the version of podkop the page shows, and the one of sing-box: the version of sing-box
+# go.mod requires, and the commit of podkop-engine it is replaced with
+ENGINE_BASE:=$(shell sed -n 's|^require github.com/sagernet/sing-box v||p;s|^[[:space:]]*github.com/sagernet/sing-box v\([^ ]*\)$$|\1|p' $(BACKEND_DIR)/go.mod | head -n 1)
+ENGINE_COMMIT:=$(shell sed -n 's|^replace github.com/sagernet/sing-box => .*-\([0-9a-f]\{12\}\)$$|\1|p' $(BACKEND_DIR)/go.mod)
+GO_PKG_LDFLAGS_X:=$(GO_PKG).Version=$(PKG_VERSION) \
+	github.com/sagernet/sing-box/constant.Version=$(ENGINE_BASE)-pdk-$(ENGINE_COMMIT)
 
 include $(INCLUDE_DIR)/package.mk
+include $(TOPDIR)/feeds/packages/lang/golang/golang-package.mk
 
 define Package/podkop
 	SECTION:=net
 	CATEGORY:=Network
-	DEPENDS:=+sing-box +curl +jq +kmod-nft-tproxy +coreutils-base64 +bind-dig
-	CONFLICTS:=https-dns-proxy nextdns luci-app-passwall luci-app-passwall2
 	TITLE:=Domain routing app
 	URL:=https://podkop.net
-	PKGARCH:=all
+	DEPENDS:=$(GO_ARCH_DEPENDS) +ca-bundle +kmod-nft-tproxy
+	PROVIDES:=sing-box
+	CONFLICTS:=https-dns-proxy nextdns luci-app-passwall luci-app-passwall2 \
+		sing-box sing-box-tiny podkop-engine podkop-engine-full
 endef
 
 define Package/podkop/description
-	Domain routing. Use of VLESS, Shadowsocks technologies
-endef
-
-define Build/Configure
-endef
-
-define Build/Compile
-endef
-
-define Package/podkop/prerm
-#!/bin/sh
-
-grep -q "105 podkop" /etc/iproute2/rt_tables && sed -i "/105 podkop/d" /etc/iproute2/rt_tables
-
-/etc/init.d/podkop stop
-
-exit 0
+	Domain routing. Use of VLESS, Shadowsocks technologies.
+	One program: the backend of podkop and sing-box (podkop-engine) inside it. It also
+	answers as sing-box (/usr/bin/sing-box).
 endef
 
 define Package/podkop/conffiles
 /etc/config/podkop
+/etc/sing-box/
+endef
+
+define Build/Prepare
+	$(INSTALL_DIR) $(PKG_BUILD_DIR)
+	$(CP) $(BACKEND_DIR)/. $(PKG_BUILD_DIR)/
+endef
+
+# An upgrade made by apk does not stop the service (the script of the removal is not run,
+# and a start of a service that runs changes nothing): the backend that runs would stay the
+# one of the package that was replaced. opkg stops the service before an upgrade and starts
+# it after; the restart is harmless there. The guard is new: on an upgrade from podkop 0.7
+# nothing would enable it (only a fresh install enables services), so it is enabled here
+# unless the settings turn it off.
+define Package/podkop/postinst
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+if [ "$${PKG_UPGRADE}" = "1" ]; then
+	case "$$(uci -q get podkop.settings.guard)" in
+	0 | off | false | no | disabled) ;;
+	*) /etc/init.d/podkop-guard enable; /etc/init.d/podkop-guard restart ;;
+	esac
+	/etc/init.d/podkop restart
+fi
+exit 0
+endef
+
+# The stop gives back the DNS of the LAN, the firewall table and the routing.
+define Package/podkop/prerm
+#!/bin/sh
+[ -n "$${IPKG_INSTROOT}" ] && exit 0
+/etc/init.d/podkop-guard stop
+/etc/init.d/podkop stop
+grep -q "105 podkop" /etc/iproute2/rt_tables 2> /dev/null && sed -i "/105 podkop/d" /etc/iproute2/rt_tables
+exit 0
 endef
 
 define Package/podkop/install
-	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/etc/init.d/podkop $(1)/etc/init.d/podkop
+	$(INSTALL_DIR) $(1)/usr/bin
+	$(INSTALL_BIN) $(GO_PKG_BUILD_BIN_DIR)/podkop $(1)/usr/bin/podkop
+	$(LN) podkop $(1)/usr/bin/sing-box
 
+	$(INSTALL_DIR) $(1)/etc/sing-box
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./files/etc/config/podkop $(1)/etc/config/podkop
-
-	$(INSTALL_DIR) $(1)/usr/bin
-	$(INSTALL_BIN) ./files/usr/bin/podkop $(1)/usr/bin/podkop
-
-	$(INSTALL_DIR) $(1)/usr/lib/podkop
-	$(CP) ./files/usr/lib/* $(1)/usr/lib/podkop/
-
-	sed -i -e 's/__COMPILED_VERSION_VARIABLE__/$(PKG_VERSION)/g' $(1)/usr/lib/podkop/constants.sh
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./files/etc/init.d/podkop $(1)/etc/init.d/podkop
+	$(INSTALL_BIN) ./files/etc/init.d/podkop-guard $(1)/etc/init.d/podkop-guard
+	$(INSTALL_DIR) $(1)/usr/libexec/podkop
+	$(INSTALL_BIN) ./files/usr/libexec/podkop/guard $(1)/usr/libexec/podkop/guard
+	$(INSTALL_DIR) $(1)/etc/uci-defaults
+	$(INSTALL_BIN) ./files/etc/uci-defaults/99-podkop $(1)/etc/uci-defaults/99-podkop
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_DATA) ./files/etc/hotplug.d/iface/50-podkop $(1)/etc/hotplug.d/iface/50-podkop
 endef
 
 $(eval $(call BuildPackage,podkop))

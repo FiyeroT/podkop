@@ -1,0 +1,26 @@
+#!/bin/sh
+# apk (OpenWrt 25.12 and later) does not overwrite a file under /etc that was
+# edited in place or that no package owns: it keeps that file and installs the package's
+# one beside it as .apk-new. An /etc/init.d/podkop of podkop's shell backend that was
+# edited stays in place then: the service runs the shell backend's script, which calls
+# /usr/bin/podkop (the binary of this package) for its actions, and this binary calls the
+# script back. Put the package's scripts in place, the old ones aside in /etc/sing-box
+# (not in /etc/init.d, where they would show as services); a script that could not be
+# replaced stays where it was. This runs before default_postinst enables and starts the
+# services of the package.
+for service in podkop podkop-guard; do
+	[ -f /etc/init.d/$service.apk-new ] || continue
+	mkdir -p /etc/sing-box
+	old=/etc/sing-box/$service.init.before-podkop-0.8 kept=""
+	if [ -f /etc/init.d/$service ] && mv -f /etc/init.d/$service $old 2>/dev/null; then
+		chmod 0644 $old
+		kept=", the old one is $old"
+	fi
+	if mv -f /etc/init.d/$service.apk-new /etc/init.d/$service 2>/dev/null; then
+		logger -t podkop "/etc/init.d/$service was not the one of the package (edited, or left by another install) and apk kept it: replaced$kept"
+	else
+		[ -z "$kept" ] || mv -f $old /etc/init.d/$service
+		logger -t podkop "/etc/init.d/$service is not the one of the package and could not be replaced by /etc/init.d/$service.apk-new"
+	fi
+done
+exit 0

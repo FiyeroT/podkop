@@ -7,8 +7,11 @@ on:
       - 'rc/**'
     paths:
       - 'install.sh'
-      - 'podkop/files/usr/bin/**'
-      - 'podkop/files/usr/lib/**'
+      - 'podkop/files/etc/init.d/**'
+      - 'podkop/files/etc/uci-defaults/**'
+      - 'podkop/files/etc/hotplug.d/**'
+      - 'podkop/files/usr/libexec/**'
+      - 'sdk/**'
       - '.github/workflows/shellcheck.yml'
   pull_request:
     branches:
@@ -16,8 +19,11 @@ on:
       - 'rc/**'
     paths:
       - 'install.sh'
-      - 'podkop/files/usr/bin/**'
-      - 'podkop/files/usr/lib/**'
+      - 'podkop/files/etc/init.d/**'
+      - 'podkop/files/etc/uci-defaults/**'
+      - 'podkop/files/etc/hotplug.d/**'
+      - 'podkop/files/usr/libexec/**'
+      - 'sdk/**'
       - '.github/workflows/shellcheck.yml'
 
 permissions:
@@ -43,7 +49,10 @@ jobs:
         with:
           severity: error
           include-path: |
-            podkop/files/usr/bin/podkop
-            podkop/files/usr/lib/**.sh
+            podkop/files/etc/init.d/*
+            podkop/files/etc/uci-defaults/*
+            podkop/files/etc/hotplug.d/iface/*
+            podkop/files/usr/libexec/podkop/*
+            sdk/*.sh
             install.sh
           token: ${{ secrets.GITHUB_TOKEN }}

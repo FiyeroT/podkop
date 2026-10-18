@@ -102,7 +102,6 @@ update_config() {
 
 main() {
     check_system
-    sing_box
 
     /usr/sbin/ntpd -q -p 194.190.168.1 -p 216.239.35.0 -p 216.239.35.4 -p 162.159.200.1 -p 162.159.200.123
 
@@ -123,15 +122,28 @@ main() {
         fi
     fi
 
-    local grep_url_pattern
+    local grep_url_pattern pkg_ext arch
     if [ "$PKG_IS_APK" -eq 1 ]; then
-        grep_url_pattern='https://[^"[:space:]]*\.apk'
+        pkg_ext=apk
     else
-        grep_url_pattern='https://[^"[:space:]]*\.ipk'
+        pkg_ext=ipk
     fi
+    grep_url_pattern="https://[^\"[:space:]]*\.$pkg_ext"
+    # podkop is built for each architecture (the name of a package ends with the one of the
+    # router, "_" written as "-"); the packages of LuCI are the same for all
+    arch=$(pkg_arch | tr '_' '-')
+    if [ -z "$arch" ]; then
+        msg "Unknown package architecture"
+        exit 1
+    fi
+    msg "Package architecture: $arch"
 
     wget -qO- "$REPO" | grep -o "$grep_url_pattern" | while read -r url; do
         filename=$(basename "$url")
+        case "$filename" in
+            podkop-*-"$arch"."$pkg_ext" | luci-*) ;;
+            *) continue ;;
+        esac
         filepath="$DOWNLOAD_DIR/$filename"
 
         attempt=0
@@ -158,6 +170,12 @@ main() {
         msg "No packages were downloaded successfully"
         exit 1
     fi
+    if ! ls "$DOWNLOAD_DIR"/podkop-*-"$arch"."$pkg_ext" >/dev/null 2>&1; then
+        msg "No podkop package for the architecture $arch in the release"
+        exit 1
+    fi
+
+    replace_sing_box
 
     for pkg in podkop luci-app-podkop; do
         file=""
@@ -169,7 +187,12 @@ main() {
         done
         if [ -n "$file" ]; then
             msg "Installing $file..."
-            pkg_install "$DOWNLOAD_DIR/$file"
+            if [ "$pkg" = "podkop" ] && [ "$PKG_IS_APK" -eq 1 ]; then
+                # shellcheck disable=SC2086
+                apk add --allow-untrusted "$DOWNLOAD_DIR/$file" $APK_CONFLICTS
+            else
+                pkg_install "$DOWNLOAD_DIR/$file"
+            fi
             sleep 3
         fi
     done
@@ -291,20 +314,48 @@ check_system() {
     fi
 }
 
-sing_box() {
-    if ! pkg_is_installed "^sing-box"; then
+pkg_arch() {
+    if [ "$PKG_IS_APK" -eq 1 ]; then
+        apk --print-arch
+    else
+        # the last architecture of opkg is the one of the router (all and noarch go first)
+        opkg print-architecture | awk '$2 != "all" && $2 != "noarch" { arch = $2 } END { print arch }'
+    fi
+}
+
+# Since 0.8 podkop carries sing-box: /usr/bin/sing-box is podkop. A sing-box installed as a
+# package of its own conflicts with it and is replaced. Called once the packages are
+# downloaded: while podkop 0.7 runs, the router resolves names through sing-box.
+APK_CONFLICTS=""
+replace_sing_box() {
+    local pkg found=""
+    for pkg in sing-box sing-box-tiny podkop-engine podkop-engine-full; do
+        if [ "$PKG_IS_APK" -eq 1 ]; then
+            apk list --installed 2>/dev/null | grep -q "^$pkg-[0-9]" && found="$found $pkg"
+        else
+            opkg list-installed | grep -q "^$pkg - " && found="$found $pkg"
+        fi
+    done
+    [ -z "$found" ] && return
+
+    msg "podkop includes sing-box now, the package replaces:$found"
+    [ -x /etc/init.d/podkop ] && service podkop stop
+    if [ "$PKG_IS_APK" -eq 0 ]; then
+        # shellcheck disable=SC2086
+        opkg remove --force-depends $found
         return
     fi
-
-    sing_box_version=$(sing-box version | head -n 1 | awk '{print $3}')
-    required_version="1.12.4"
-
-    if [ "$(printf '%s\n%s\n' "$sing_box_version" "$required_version" | sort -V | head -n 1)" != "$required_version" ]; then
-        msg "sing-box version $sing_box_version is older than the required version $required_version."
-        msg "Removing old version..."
-        service podkop stop
-        pkg_remove sing-box
-    fi
+    # apk replaces them in the transaction that installs podkop: a package podkop 0.7 depends
+    # on cannot be removed before. sing-box is a name podkop provides, so it cannot be one of
+    # the conflicts: it only leaves the list of the packages asked for (the world), and goes
+    # when nothing depends on it.
+    for pkg in $found; do
+        if [ "$pkg" = "sing-box" ]; then
+            grep -q "^sing-box\([^a-z0-9-]\|$\)" /etc/apk/world 2> /dev/null && apk del sing-box
+        else
+            APK_CONFLICTS="$APK_CONFLICTS !$pkg"
+        fi
+    done
 }
 
 main

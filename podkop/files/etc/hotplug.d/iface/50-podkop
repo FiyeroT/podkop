@@ -1,0 +1,12 @@
+#!/bin/sh
+# netifd runs this at every change of an interface. A restart of the network
+# ("/etc/init.d/network restart") flushes the routing rules netifd does not own and takes
+# the route of the loopback with it: the rule and the route that hand marked packets to
+# the backend are gone, and the names of the lists open nowhere until podkop is
+# restarted. The backend puts back what is gone and nothing else; the firewall does the
+# same for itself in 20-firewall. Every ifup asks: after a restart of the network the
+# loopback comes up last, and at the ifup of another interface it may still be down.
+[ "$ACTION" = ifup ] || exit 0
+[ -S /var/run/podkop/ctl.sock ] || exit 0
+/usr/bin/podkop restore_routing > /dev/null 2>&1 &
+exit 0
