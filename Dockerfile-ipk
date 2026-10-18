@@ -1,6 +1,9 @@
 FROM itdoginfo/openwrt-sdk-ipk:24.10.6
 
 ARG PODKOP_VERSION
+# the packages to build: CI builds podkop for each architecture apart (sdk/build.sh) and
+# takes only the page from here
+ARG PACKAGES="podkop luci-app-podkop"
 
 COPY ./sdk/golang-feed.sh /builder/golang-feed.sh
 RUN sh /builder/golang-feed.sh
@@ -11,5 +14,4 @@ COPY ./luci-app-podkop /builder/package/feeds/luci/luci-app-podkop
 
 RUN export PODKOP_VERSION="v${PODKOP_VERSION}" && \
     make defconfig && \
-    make package/podkop/compile V=s -j4 && \
-    make package/luci-app-podkop/compile V=s -j4
+    for p in ${PACKAGES}; do make package/$p/compile V=s -j4 || exit 1; done

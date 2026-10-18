@@ -9,7 +9,12 @@ tmp=$(mktemp -d)
 git -C "$tmp" init -q
 git -C "$tmp" remote add origin "$REPO"
 git -C "$tmp" sparse-checkout set lang/golang
-git -C "$tmp" fetch -q --depth 1 --filter=blob:none origin "$COMMIT"
+n=0
+until git -C "$tmp" fetch -q --depth 1 --filter=blob:none origin "$COMMIT"; do
+	n=$((n + 1))
+	[ $n -lt 5 ] || { echo "the fetch of lang/golang failed $n times" >&2; exit 1; }
+	sleep 20
+done
 git -C "$tmp" checkout -q FETCH_HEAD
 rm -rf feeds/packages/lang/golang
 cp -a "$tmp/lang/golang" feeds/packages/lang/golang
