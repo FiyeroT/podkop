@@ -1,0 +1,1270 @@
+// Package supervisor is the backend as a running thing: it brings the router from its
+// settings to a working state, keeps it there when the settings change, and takes it back.
+//
+// One goroutine does everything, one step after another, so no two changes of the router
+// meet. A change of the settings is applied by comparing what it would write with what
+// runs: sing-box is replaced only for another configuration, a list that changed is a
+// file sing-box reads again, a firewall set that changed is refilled in place.
+package supervisor
+
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"runtime/debug"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/itdoginfo/podkop/src/backend/api"
+	"github.com/itdoginfo/podkop/src/backend/dataplane"
+	"github.com/itdoginfo/podkop/src/backend/engine"
+	"github.com/itdoginfo/podkop/src/backend/firewall"
+	"github.com/itdoginfo/podkop/src/backend/lists"
+	"github.com/itdoginfo/podkop/src/backend/model"
+	"github.com/itdoginfo/podkop/src/backend/plan"
+	"github.com/itdoginfo/podkop/src/backend/probe"
+	"github.com/itdoginfo/podkop/src/backend/render"
+	"github.com/itdoginfo/podkop/src/backend/uci"
+	E "github.com/sagernet/sing/common/exceptions"
+)
+
+// System is the router outside sing-box as the supervisor changes it. The real one is
+// Router; a test has its own and sees the order of the calls.
+type System interface {
+	// LANAddress is the IPv4 address of the LAN, empty when it is not known.
+	LANAddress() string
+	ApplyRouting() error
+	RemoveRouting() error
+	// RoutingPresent tells whether the rule and the route of ApplyRouting are both there,
+	// FirewallPresent whether the table is.
+	RoutingPresent() (bool, error)
+	FirewallPresent() (bool, error)
+	// SetClashSecret writes the key of the Clash API into the settings.
+	SetClashSecret(key string) error
+	// UpdateFirewall brings the firewall table from the previous plan to the next; with
+	// no previous plan the table is made anew.
+	UpdateFirewall(previous *firewall.Plan, next *firewall.Plan) error
+	RemoveFirewall() error
+	// TakeOverDNS points the resolver of the LAN at the backend, RestoreDNS gives it back
+	// what it had. Each tells whether it changed anything.
+	TakeOverDNS() (bool, error)
+	RestoreDNS() (bool, error)
+}
+
+// Engine is sing-box as the supervisor uses it. The real one is the package engine's
+// (Options.Engine nil); a test has its own and runs the supervisor without sing-box.
+type Engine interface {
+	// Check builds a configuration as it will run, the rule-set files it names included,
+	// and tells why sing-box refuses it (render.Check).
+	Check(config []byte, links []plan.Link) error
+	// Build makes an instance of a configuration; nothing runs yet (engine.BuildLogged).
+	Build(config []byte, sink engine.LogSink, hooks ...engine.ConnectionHook) (Instance, error)
+	// Ready asks the DNS inbound of a started instance for the readiness name until an
+	// answer from FakeIP comes or the context ends (engine.Probe).
+	Ready(ctx context.Context) error
+	// Notes returns what sing-box noted that was not returned before (engine.Notes).
+	Notes() []string
+}
+
+// Instance is a sing-box of one configuration (engine.Instance).
+type Instance interface {
+	OnRuleSetUpdate(tags []string, updated func(tag string))
+	Start() error
+	// Close returns engine.ErrStuck when the instance does not close in time.
+	Close(patience time.Duration) error
+	RuleSetContent(tag string) ([]byte, bool)
+	RuleSetUpdated(tag string) (time.Time, bool)
+	UpdateRuleSets(ctx context.Context) (engine.RuleSetUpdate, error)
+	FakeIPAddress(name string) (netip.Addr, bool, error)
+}
+
+var _ Instance = (*engine.Instance)(nil)
+
+// realEngine is the Engine of the package engine.
+type realEngine struct{}
+
+func (realEngine) Check(config []byte, links []plan.Link) error {
+	_, err := render.Check(config, links)
+	return err
+}
+
+func (realEngine) Build(config []byte, sink engine.LogSink, hooks ...engine.ConnectionHook) (Instance, error) {
+	instance, err := engine.BuildLogged(config, sink, hooks...)
+	if err != nil {
+		return nil, err
+	}
+	return instance, nil
+}
+
+func (realEngine) Ready(ctx context.Context) error {
+	return engine.Probe(ctx, dataplane.DNSServer.String(), dataplane.ReadinessName, dataplane.FakeIPPrefix)
+}
+
+func (realEngine) Notes() []string { return engine.Notes() }
+
+// Options say where the supervisor finds and puts things.
+type Options struct {
+	// SettingsPath is the UCI file of the backend.
+	SettingsPath string
+	// RuleSetDir is where the rule-set files go; the usual place when empty.
+	RuleSetDir string
+	// StagingDir is where a candidate's files are put to be checked before anything of
+	// the running state is touched.
+	StagingDir string
+	// StatePath is the file that tells a guard outside the process what the backend is
+	// doing (see writeState); none when empty.
+	StatePath string
+	// ConfigDir is where the configuration that runs and the last one that was refused
+	// are kept for the user interface (RunningConfig, RejectedConfig); in RAM; none when
+	// empty.
+	ConfigDir string
+	// DownloadURL is the download test URL of urltest groups whose section does not set
+	// one; none when empty.
+	DownloadURL string
+	// ReadyTimeout is how long a started sing-box has to answer the probe.
+	ReadyTimeout time.Duration
+	System       System
+	// Log is told what happens: a level (info, warn, error) and a message.
+	Log func(level string, message string)
+	// EngineLog, when set, is given the lines sing-box logs.
+	EngineLog engine.LogSink
+	// Engine is sing-box; the real one when nil.
+	Engine Engine
+	// Watcher, when set, makes the checks with made-up names possible: the configuration
+	// gets their rules, and sing-box shows the watcher the connections it routes. Who
+	// sets it serves the dead end of those connections (probe.ServeDeadEnd).
+	Watcher *probe.Watcher
+}
+
+// The files of Options.ConfigDir (api.RunningConfig, api.RejectedConfig). The
+// configuration that runs is there while it runs, written after every start that came
+// up, the start of the previous configuration included; it goes at the stop and when the
+// router is given back. The last configuration sing-box refused is there until the next
+// settings are read, so a message that names a place in it (outbounds[2]) can be read
+// beside it; it goes at the stop.
+const (
+	RunningConfig  = api.RunningConfig
+	RejectedConfig = api.RejectedConfig
+)
+
+// Result, Status, ListsUpdate, ListState and ProbeResult are what the supervisor answers
+// those who ask from outside, the types of the socket.
+type (
+	Result      = api.Result
+	Status      = api.Status
+	ListsUpdate = api.ListsUpdate
+	ListState   = api.ListState
+	ProbeResult = api.ProbeResult
+)
+
+// Supervisor holds what runs now.
+type Supervisor struct {
+	options Options
+	// current is nil when nothing runs: before the boot, after a boot or a change that
+	// could not bring anything up, after the stop.
+	current *running
+	// derive is signalled when sing-box has loaded new content into a rule set
+	derive chan struct{}
+	// requests are changes asked for from another goroutine, each with where to answer
+	requests chan chan Result
+	// updates are updates of the lists asked for from another goroutine
+	updates chan chan ListsUpdate
+	// probes are questions about a check name asked from another goroutine
+	probes chan probeRequest
+	// statuses are questions about the state of the lists from another goroutine
+	statuses chan chan []ListState
+	// restores are asks to put back what the network took, from another goroutine
+	restores chan chan string
+	// stuck tells that an instance of sing-box did not close: nothing more can run in
+	// this process (see close)
+	stuck bool
+	// clashSecret is the key of the Clash API the settings had last, or the one this
+	// process made when they had none (see clashKey)
+	clashSecret string
+	// listChecks are what the checks of local lists found, by format and content: a list
+	// that did not change is not read again. checkedLists are the
+	// lists the configuration that runs was checked with.
+	listChecks   map[listKey]listCheck
+	checkedLists map[listKey]bool
+	// derived is what the firewall sets were made of last, read what was read of each
+	// rule set for them
+	derived *derivation
+	read    map[derivationKey]readRules
+
+	statusAccess sync.Mutex
+	status       Status
+	facts        api.Facts
+}
+
+// running is a state of the router that was brought up.
+type running struct {
+	settings *model.Config
+	result   *plan.Result
+	instance Instance
+	// firewall is the plan the table was last brought to
+	firewall *firewall.Plan
+}
+
+// what an update of the lists asked for from outside may take
+const listsUpdateTimeout = 5 * time.Minute
+
+type probeRequest struct {
+	// label is the label of the name; empty when the backend is to open the connection
+	// itself, as a program of the router
+	label string
+	wait  time.Duration
+	reply chan ProbeResult
+}
+
+// how long a question about a check name may wait for the connection, at the most and
+// when the caller does not say
+const (
+	probeWaitLimit   = 10 * time.Second
+	probeWaitDefault = 3 * time.Second
+)
+
+// New makes a supervisor; nothing is touched yet.
+func New(options Options) *Supervisor {
+	if options.RuleSetDir == "" {
+		options.RuleSetDir = plan.DefaultRuleSetDir
+	}
+	if options.StagingDir == "" {
+		options.StagingDir = "/tmp/podkop/candidate"
+	}
+	if options.ReadyTimeout == 0 {
+		options.ReadyTimeout = 15 * time.Second
+	}
+	if options.Log == nil {
+		options.Log = func(string, string) {}
+	}
+	if options.Engine == nil {
+		options.Engine = realEngine{}
+	}
+	return &Supervisor{options: options, derive: make(chan struct{}, 1), requests: make(chan chan Result), updates: make(chan chan ListsUpdate), probes: make(chan probeRequest), statuses: make(chan chan []ListState), restores: make(chan chan string)}
+}
+
+func (s *Supervisor) log(level string, message ...any) {
+	s.options.Log(level, oneLine(E.New(message...).Error()))
+}
+
+// Running tells whether a state is up.
+func (s *Supervisor) Running() bool {
+	return s.current != nil
+}
+
+// Status returns the state of the backend. It may be called from any goroutine.
+func (s *Supervisor) Status() Status {
+	s.statusAccess.Lock()
+	defer s.statusAccess.Unlock()
+	return s.status
+}
+
+// Facts tells what the commands need to know of what runs. It may be called from any
+// goroutine.
+func (s *Supervisor) Facts() api.Facts {
+	s.statusAccess.Lock()
+	defer s.statusAccess.Unlock()
+	return s.facts
+}
+
+// factsOf are the facts of a state that runs.
+func factsOf(current *running) api.Facts {
+	if current == nil {
+		return api.Facts{}
+	}
+	return api.Facts{ClashAPI: current.result.Dataplane.ClashAPI, ClashSecret: current.result.Dataplane.ClashSecret}
+}
+
+// done records what a boot or a change came to and returns it.
+func (s *Supervisor) done(ok bool, replaced bool, message ...any) Result {
+	result := Result{OK: ok, Message: oneLine(E.New(message...).Error())}
+	s.statusAccess.Lock()
+	defer s.statusAccess.Unlock()
+	now := time.Now()
+	if s.current == nil {
+		s.status.Running = false
+	} else if !s.status.Running || replaced {
+		s.status.Running, s.status.Since = true, now
+	}
+	s.status.Last, s.status.LastAt = result, now
+	s.facts = factsOf(s.current)
+	if s.current == nil {
+		s.writeState(stateReleased)
+	} else {
+		s.writeState(stateRunning)
+	}
+	return result
+}
+
+// What the backend is doing, for a guard outside the process (the liveness probe of the
+// package): it judges the silence of the DNS inbound only of a backend that runs, and of
+// one that has been starting or applying for too long. Released: there is no sing-box, and
+// the DNS of the LAN is the router's own, on purpose.
+const (
+	stateBooting  = "booting"
+	stateApplying = "applying"
+	stateRunning  = "running"
+	stateReleased = "released"
+	stateStopped  = "stopped"
+)
+
+// writeState records what the backend is doing: the word, the process and the time, one
+// line. The file is in RAM; a failure to write it is no failure of the backend.
+func (s *Supervisor) writeState(state string) {
+	if s.options.StatePath == "" {
+		return
+	}
+	line := state + " " + strconv.Itoa(os.Getpid()) + " " + strconv.FormatInt(time.Now().Unix(), 10) + "\n"
+	_ = render.WriteFile(s.options.StatePath, []byte(line))
+}
+
+// Request asks the goroutine of Run to apply the settings and waits for what it came
+// to. It is for callers outside that goroutine.
+func (s *Supervisor) Request(ctx context.Context) Result {
+	reply := make(chan Result, 1)
+	select {
+	case s.requests <- reply:
+	case <-ctx.Done():
+		return Result{Message: "the backend is busy"}
+	}
+	select {
+	case result := <-reply:
+		return result
+	case <-ctx.Done():
+		return Result{Message: "the backend did not finish in time; its log tells how it went"}
+	}
+}
+
+// UpdateLists downloads every list now instead of at the update interval and waits for
+// what it came to: the rule sets sing-box downloads, and the plain lists the backend
+// downloads itself. It is for callers outside the goroutine of Run.
+func (s *Supervisor) UpdateLists(ctx context.Context) ListsUpdate {
+	reply := make(chan ListsUpdate, 1)
+	select {
+	case s.updates <- reply:
+	case <-ctx.Done():
+		return ListsUpdate{Lines: []string{"the backend is busy"}}
+	}
+	select {
+	case result := <-reply:
+		return result
+	case <-ctx.Done():
+		return ListsUpdate{Lines: []string{"the update did not finish in time; the log of the backend tells how it went"}}
+	}
+}
+
+// updateLists starts an update of the lists of the state that runs and answers when it
+// is over. The goroutine of Run is not held: the settings can be applied meanwhile, and
+// an update of a state that was replaced ends with that state.
+func (s *Supervisor) updateLists(reply chan<- ListsUpdate) {
+	current := s.current
+	if current == nil {
+		reply <- ListsUpdate{Lines: []string{"nothing runs: there are no lists to update"}}
+		return
+	}
+	instance := current.instance
+	go func() {
+		defer s.survive("the update of the lists asked for", func() {
+			// the answer may have gone already
+			select {
+			case reply <- ListsUpdate{Lines: []string{"the update ended with a fault of the backend; its log has it"}}:
+			default:
+			}
+		})
+		deadline := time.Now().Add(listsUpdateTimeout)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		result := ListsUpdate{OK: true}
+		summary, err := instance.UpdateRuleSets(ctx)
+		switch {
+		case err != nil:
+			result.OK = false
+			result.Lines = append(result.Lines, "rule sets: "+oneLine(err.Error()))
+		case summary.Total > 0:
+			result.OK = summary.Failed == 0
+			result.Lines = append(result.Lines, E.New("rule sets: ", summary.Total, " asked, ", summary.Loaded, " with a new list, ", summary.Failed, " failed").Error())
+		}
+		if len(result.Lines) == 0 {
+			result.Lines = []string{"the settings have no list that is downloaded"}
+		}
+		level := "info"
+		if !result.OK {
+			level = "warn"
+		}
+		s.log(level, "lists updated on request: ", strings.Join(result.Lines, "; "))
+		reply <- result
+	}()
+}
+
+// ListStatus tells what is known of the rule sets of the configuration that runs: none
+// when nothing runs. It is for callers outside the goroutine of Run.
+func (s *Supervisor) ListStatus(ctx context.Context) []ListState {
+	reply := make(chan []ListState, 1)
+	select {
+	case s.statuses <- reply:
+	case <-ctx.Done():
+		return nil
+	}
+	select {
+	case states := <-reply:
+		return states
+	case <-ctx.Done():
+		return nil
+	}
+}
+
+// listStatus collects the state of the lists of what runs. A remote rule set's last
+// error and next try are sing-box's own and not told here; its log has them (the first
+// failure as an error, then a count every ten minutes).
+func (s *Supervisor) listStatus() []ListState {
+	current := s.current
+	states := []ListState{}
+	if current == nil {
+		return states
+	}
+	for _, ruleSet := range current.result.RuleSets {
+		state := ListState{Tag: ruleSet.Tag}
+		switch {
+		case ruleSet.Path == "":
+			state.Kind, state.URL, state.Format = "remote", ruleSet.URL, ruleSet.Format
+			if updated, known := current.instance.RuleSetUpdated(ruleSet.Tag); known {
+				state.LastUpdated = &updated
+			}
+		default:
+			state.Kind, state.Path = "file", ruleSet.Path
+		}
+		states = append(states, state)
+	}
+	return states
+}
+
+// RestoreRouting puts back what something of the router took from the backend, as at
+// "/etc/init.d/network restart": netifd, restarted, flushes the rules it does not own,
+// and the loopback that goes down takes the route of the table with it. The firewall
+// table and the DNS of the LAN are put back too when they are gone. Nothing is rebuilt;
+// with nothing running nothing is done. It tells what it did; it is for callers outside
+// the goroutine of Run (the hotplug script of the package asks at every ifup).
+func (s *Supervisor) RestoreRouting(ctx context.Context) string {
+	reply := make(chan string, 1)
+	select {
+	case s.restores <- reply:
+	case <-ctx.Done():
+		return "the backend is busy"
+	}
+	select {
+	case result := <-reply:
+		return result
+	case <-ctx.Done():
+		return "the backend is busy"
+	}
+}
+
+func (s *Supervisor) restoreRouting() string {
+	current := s.current
+	if current == nil {
+		return "nothing runs"
+	}
+	var restored []string
+	present, err := s.options.System.RoutingPresent()
+	if err != nil {
+		s.log("warn", "look at the routing: ", err)
+	} else if !present {
+		err = s.options.System.ApplyRouting()
+		if err != nil {
+			s.log("error", "put the routing back: ", err)
+		} else {
+			restored = append(restored, "the rule and the route of the routing table")
+		}
+	}
+	present, err = s.options.System.FirewallPresent()
+	if err != nil {
+		s.log("warn", "look at the firewall table: ", err)
+	} else if !present {
+		err = s.options.System.UpdateFirewall(nil, current.firewall)
+		if err != nil {
+			s.log("error", "put the firewall table back: ", err)
+		} else {
+			restored = append(restored, "the firewall table")
+		}
+	}
+	if current.result.Dataplane.TakeDNS {
+		changed, err := s.options.System.TakeOverDNS()
+		if err != nil {
+			s.log("error", "point the DNS of the LAN at the backend: ", err)
+		} else if changed {
+			restored = append(restored, "the DNS of the LAN")
+		}
+	}
+	if len(restored) == 0 {
+		return "nothing was missing"
+	}
+	message := strings.Join(restored, ", ") + " had gone and are back"
+	s.log("warn", "the network changed: ", message)
+	return message
+}
+
+// Probe tells what the backend saw of the check name of a label: whether its DNS question
+// came, and whether a connection to it came in through the transparent proxy inbound. It
+// waits for the connection for the given time, the usual one when that is zero. A
+// device of the LAN is checked this way: it opens a connection to the name and asks.
+func (s *Supervisor) Probe(ctx context.Context, label string, wait time.Duration) ProbeResult {
+	if !probe.ValidLabel(label) {
+		return ProbeResult{}
+	}
+	return s.probe(ctx, probeRequest{label: label, wait: wait})
+}
+
+// ProbeSelf checks the router itself: the backend opens a connection to a fresh check
+// name with the resolver and the routing a program of the router has, and tells what
+// came of it.
+func (s *Supervisor) ProbeSelf(ctx context.Context) ProbeResult {
+	return s.probe(ctx, probeRequest{})
+}
+
+func (s *Supervisor) probe(ctx context.Context, request probeRequest) ProbeResult {
+	if request.wait <= 0 {
+		request.wait = probeWaitDefault
+	}
+	request.wait = min(request.wait, probeWaitLimit)
+	request.reply = make(chan ProbeResult, 1)
+	select {
+	case s.probes <- request:
+	case <-ctx.Done():
+		return ProbeResult{}
+	}
+	select {
+	case result := <-request.reply:
+		return result
+	case <-ctx.Done():
+		return ProbeResult{}
+	}
+}
+
+// answerProbe answers a question about a check name without holding the goroutine of Run.
+func (s *Supervisor) answerProbe(request probeRequest) {
+	current, watcher := s.current, s.options.Watcher
+	if current == nil || watcher == nil {
+		request.reply <- ProbeResult{}
+		return
+	}
+	instance := current.instance
+	go func() {
+		defer s.survive("a check name", func() {
+			select {
+			case request.reply <- ProbeResult{}:
+			default:
+			}
+		})
+		ctx, cancel := context.WithTimeout(context.Background(), request.wait)
+		defer cancel()
+		label := request.label
+		if label == "" {
+			label = probe.NewLabel()
+			go func() {
+				defer s.survive("a knock at a check name", nil)
+				_, _ = probe.Knock(ctx, label)
+			}()
+		}
+		arrival, arrived := watcher.Wait(ctx, label)
+		var result ProbeResult
+		address, known, err := instance.FakeIPAddress(probe.Name(label))
+		if err != nil {
+			s.log("error", "a check name: ", err)
+		} else if known {
+			result.DNS, result.Address = true, address.String()
+		}
+		// through another inbound a connection proves nothing of the firewall and the
+		// routing: a proxy inbound of a section is reached without them
+		if arrived && arrival.Inbound == plan.TProxyInboundTag {
+			result.Connection, result.Client = true, arrival.Source.String()
+		}
+		request.reply <- result
+	}()
+}
+
+// Run boots, then serves until the context ends: reload applies the settings again, a
+// rule set that sing-box reloaded refills the firewall sets. At the end everything is
+// taken back.
+func (s *Supervisor) Run(ctx context.Context, reload <-chan struct{}) error {
+	s.Boot()
+	// a download brings several rule sets one after another: the firewall is refilled
+	// once, a moment after the first, and nothing else waits meanwhile
+	var merge <-chan time.Time
+	for !s.stuck {
+		select {
+		case <-ctx.Done():
+			s.Stop()
+			return s.stuckError()
+		case <-reload:
+			s.Apply()
+		case reply := <-s.requests:
+			reply <- s.Apply()
+		case reply := <-s.updates:
+			s.updateLists(reply)
+		case request := <-s.probes:
+			s.answerProbe(request)
+		case reply := <-s.statuses:
+			reply <- s.listStatus()
+		case reply := <-s.restores:
+			reply <- s.restoreRouting()
+		case <-s.derive:
+			if merge == nil {
+				merge = time.After(deriveMerge)
+			}
+		case <-merge:
+			merge = nil
+			s.refreshFirewall()
+		}
+	}
+	return s.stuckError()
+}
+
+// how long the refill of the firewall sets waits for more rule sets to load
+const deriveMerge = 500 * time.Millisecond
+
+// stuckError is what ends Run when sing-box did not close: nil when it did.
+func (s *Supervisor) stuckError() error {
+	if s.stuck {
+		return engine.ErrStuck
+	}
+	return nil
+}
+
+// listKey is a local list as its check knows it: its format and the hash of its content.
+type listKey struct {
+	format string
+	sum    [sha256.Size]byte
+}
+
+type listCheck struct {
+	skipped int
+	first   string
+	err     error
+}
+
+// checkList is plan.Options.CheckList with what the checks found remembered: a list is
+// read once an apply however many times the plan is built, and not at all when it is as
+// it was. The lists of this apply are noted in used.
+func (s *Supervisor) checkList(used map[listKey]bool) func(format string, content []byte) (int, string, error) {
+	return func(format string, content []byte) (int, string, error) {
+		key := listKey{format, sha256.Sum256(content)}
+		used[key] = true
+		if found, known := s.listChecks[key]; known {
+			return found.skipped, found.first, found.err
+		}
+		skipped, first, err := engine.CheckRuleSet(format, content)
+		s.listChecks[key] = listCheck{skipped, first, err}
+		return skipped, first, err
+	}
+}
+
+func sameKeys(left map[listKey]bool, right map[listKey]bool) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for key := range left {
+		if !right[key] {
+			return false
+		}
+	}
+	return true
+}
+
+// candidate is settings that were read and checked, not yet running.
+type candidate struct {
+	settings *model.Config
+	result   *plan.Result
+}
+
+// prepare reads the settings and makes the configuration and the files of them. The
+// configuration is built by sing-box with its files in a place of their own: settings
+// that cannot run are found out here, with nothing of the running state touched.
+// faultWhileReading lets a test fault where the settings are read.
+var faultWhileReading func()
+
+func (s *Supervisor) prepare() (next *candidate, err error) {
+	// A fault while the settings are read (the UCI file, a link, a list) must not end the
+	// process: procd would start it again, the same settings would fault again, and the
+	// DNS of the LAN would point at a backend that is never there. The settings are
+	// refused instead, as unusable ones are.
+	defer func() {
+		if fault := recover(); fault != nil {
+			os.Stderr.Write(debug.Stack())
+			next, err = nil, E.New("a fault of the backend while the settings were read: ", fault)
+		}
+	}()
+	s.keepConfig(RejectedConfig, nil)
+	content, err := os.ReadFile(s.options.SettingsPath)
+	if err != nil {
+		return nil, E.Cause(err, "read the settings")
+	}
+	if faultWhileReading != nil {
+		faultWhileReading()
+	}
+	parsed, err := uci.Parse(content)
+	if err != nil {
+		return nil, E.Cause(err, "read the settings")
+	}
+	settings, err := model.Load(parsed)
+	if err != nil {
+		return nil, E.Cause(err, "read the settings")
+	}
+	s.clashKey(settings)
+	facts := plan.Facts{LANAddress: s.options.System.LANAddress()}
+	if s.listChecks == nil {
+		s.listChecks = make(map[listKey]listCheck)
+	}
+	used := make(map[listKey]bool)
+	build := func(ruleSetDir string) (*plan.Result, error) {
+		options := plan.Options{RuleSetDir: ruleSetDir, DecodeLink: engine.DecodeLink, CheckList: s.checkList(used), DownloadURL: s.options.DownloadURL}
+		if s.options.Watcher != nil {
+			options.CheckNames = plan.CheckNames{Suffix: probe.Suffix, DeadEndAddress: probe.DeadEndAddress, DeadEndPort: probe.DeadEndPort}
+		}
+		return plan.Build(settings, facts, options)
+	}
+	result, err := build(s.options.RuleSetDir)
+	if err != nil {
+		return nil, err
+	}
+	// what was left out or cannot be honoured is told on every apply: who made a typo
+	// looks at the log after the change
+	for _, warning := range result.Warnings {
+		s.log("warn", warning)
+	}
+	// The configuration that runs, with the same local lists, was built by sing-box
+	// already: it is not built again, a big list read again for it
+	// and the memory of a second copy beside the one that runs. A local list that
+	// changed is checked by sing-box as before, with what it holds against the DNS rules.
+	if s.current != nil && bytes.Equal(result.Config, s.current.result.Config) && sameKeys(used, s.checkedLists) {
+		s.forgetLists(used)
+		return &candidate{settings: settings, result: result}, nil
+	}
+	staged, err := build(filepath.Join(s.options.StagingDir, "rulesets"))
+	if err != nil {
+		return nil, err
+	}
+	// the files of the check are not needed after it, and they are in RAM
+	defer os.RemoveAll(s.options.StagingDir)
+	for _, path := range staged.FileOrder {
+		err = render.WriteFile(path, staged.Files[path])
+		if err != nil {
+			return nil, E.Cause(err, "write a rule-set file to check")
+		}
+	}
+	err = s.options.Engine.Check(staged.Config, staged.Links)
+	s.tellNotes()
+	s.forgetLists(used)
+	// what the check built is given back before an instance reads the lists again
+	debug.FreeOSMemory()
+	if err != nil {
+		// kept as it would have run: the same but for where the rule-set files are
+		s.keepConfig(RejectedConfig, result.Config)
+		return nil, err
+	}
+	s.checkedLists = used
+	return &candidate{settings: settings, result: result}, nil
+}
+
+// forgetLists keeps what the checks found only of the lists of this apply.
+func (s *Supervisor) forgetLists(used map[listKey]bool) {
+	for key := range s.listChecks {
+		if !used[key] {
+			delete(s.listChecks, key)
+		}
+	}
+}
+
+// writeFiles stores the rule-set files that differ from what the previous state wrote.
+func (s *Supervisor) writeFiles(result *plan.Result, previous *plan.Result) error {
+	for _, path := range result.FileOrder {
+		if previous != nil && bytes.Equal(previous.Files[path], result.Files[path]) {
+			continue
+		}
+		err := render.WriteFile(path, result.Files[path])
+		if err != nil {
+			return E.Cause(err, "write the rule-set file ", path)
+		}
+	}
+	return nil
+}
+
+// start builds and starts sing-box of a candidate and waits until it answers.
+func (s *Supervisor) start(next *candidate, previous *plan.Result) (Instance, error) {
+	err := s.writeFiles(next.result, previous)
+	if err != nil {
+		return nil, err
+	}
+	// sing-box opens the cache file but does not make its directory. The shell backend made
+	// /tmp/sing-box at every start; here it was there only when a rule-set file had been
+	// written into it, and after a reboot settings whose lists are all downloaded or local
+	// write none
+	if path := next.settings.Settings.CachePath; path != "" {
+		err = os.MkdirAll(filepath.Dir(path), 0o755)
+		if err != nil {
+			s.log("warn", "make the directory of the cache file: ", err)
+		}
+	}
+	// what the instance before and the check left is given back before this one reads its
+	// lists
+	debug.FreeOSMemory()
+	var hooks []engine.ConnectionHook
+	if s.options.Watcher != nil {
+		hooks = append(hooks, s.options.Watcher.Note)
+	}
+	instance, err := s.options.Engine.Build(next.result.Config, s.options.EngineLog, hooks...)
+	if err != nil {
+		return nil, E.Cause(err, "build sing-box")
+	}
+	// a rule set that sing-box loads refills the firewall sets: told from before the
+	// start, so that a load during the start or right after it is not missed, and once an
+	// instance, so that applies with the same configuration do not add more callbacks
+	tags := make([]string, len(next.result.RuleSets))
+	for index, ruleSet := range next.result.RuleSets {
+		tags[index] = ruleSet.Tag
+	}
+	instance.OnRuleSetUpdate(tags, func(string) {
+		select {
+		case s.derive <- struct{}{}:
+		default:
+		}
+	})
+	err = instance.Start()
+	if err != nil {
+		return nil, E.Cause(err, "start sing-box")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), s.options.ReadyTimeout)
+	defer cancel()
+	err = s.options.Engine.Ready(ctx)
+	if err != nil {
+		s.close(instance)
+		return nil, err
+	}
+	s.tellNotes()
+	s.storeConfig(next)
+	return instance, nil
+}
+
+// tellNotes logs what sing-box noted as deprecated and the log does not have yet: each
+// note once in the life of the process, those of the start included.
+func (s *Supervisor) tellNotes() {
+	for _, note := range s.options.Engine.Notes() {
+		s.log("warn", note)
+	}
+}
+
+// compat: config-export
+// storeConfig keeps the configuration that runs: in ConfigDir, which the user interface
+// shows, and at the path the settings name, an export for those who read it there (the
+// shell backend compares with it). sing-box here is given the configuration in memory.
+// The export is written only when it differs: the path is on flash as a rule.
+func (s *Supervisor) storeConfig(running *candidate) {
+	s.keepConfig(RunningConfig, running.result.Config)
+	path := running.settings.Settings.ConfigPath
+	if path == "" {
+		return
+	}
+	current, err := os.ReadFile(path)
+	if err == nil && bytes.Equal(current, running.result.Config) {
+		return
+	}
+	err = render.WriteFile(path, running.result.Config)
+	if err != nil {
+		s.log("warn", "store the configuration at ", path, ": ", err)
+	}
+}
+
+// keepConfig writes a file of ConfigDir, or removes it when content is nil.
+func (s *Supervisor) keepConfig(name string, content []byte) {
+	if s.options.ConfigDir == "" {
+		return
+	}
+	path := filepath.Join(s.options.ConfigDir, name)
+	if content == nil {
+		_ = os.Remove(path)
+		return
+	}
+	current, err := os.ReadFile(path)
+	if err == nil && bytes.Equal(current, content) {
+		return
+	}
+	err = render.WriteFile(path, content)
+	if err != nil {
+		s.log("warn", "keep the configuration at ", path, ": ", err)
+	}
+}
+
+// close stops an instance. One that does not stop leaves the process no way to go on:
+// its sockets are still bound. What the router was given is taken back, and the
+// supervisor is stuck: Run returns engine.ErrStuck, and the process that runs it ends,
+// so that the service manager starts another. It tells whether the instance closed.
+func (s *Supervisor) close(instance Instance) bool {
+	err := instance.Close(engine.StopTimeout)
+	if err == engine.ErrStuck {
+		s.log("error", "sing-box does not close: giving the router back; the process has to end")
+		s.current = nil
+		s.release()
+		s.stuck = true
+		return false
+	}
+	if err != nil {
+		s.log("warn", "sing-box closed with an error: ", err)
+	}
+	return true
+}
+
+// Boot brings the router up from the settings. When that cannot be done the router is
+// left as it is without the backend, with its own DNS working, and the supervisor stays
+// to try again when the settings change.
+func (s *Supervisor) Boot() Result {
+	started := time.Now()
+	s.writeState(stateBooting)
+	// what a backend before this one kept says nothing of this one
+	s.keepConfig(RunningConfig, nil)
+	next, err := s.prepare()
+	if err != nil {
+		s.log("error", "the settings cannot be used: ", err)
+		s.release()
+		return s.done(false, false, "the settings cannot be used: ", err)
+	}
+	instance, err := s.start(next, nil)
+	if err != nil {
+		s.log("error", err)
+		s.keepConfig(RejectedConfig, next.result.Config)
+		s.release()
+		return s.done(false, false, err)
+	}
+	s.current = &running{settings: next.settings, result: next.result, instance: instance}
+	err = s.surround(nil)
+	if err != nil {
+		s.log("error", err)
+		s.Stop()
+		return s.done(false, false, err)
+	}
+	s.log("info", "running, ", time.Since(started).Milliseconds(), " ms after the start")
+	return s.done(true, true, "started in ", time.Since(started).Milliseconds(), " ms")
+}
+
+// surround does what a running sing-box needs around it, in the order that never leaves
+// the LAN asking a resolver that is not there: the routing and the firewall first, the
+// DNS of the LAN last.
+func (s *Supervisor) surround(previousFirewall *firewall.Plan) error {
+	current := s.current
+	err := s.options.System.ApplyRouting()
+	if err != nil {
+		return E.Cause(err, "set up the routing")
+	}
+	current.firewall = s.firewallPlan(current)
+	err = s.options.System.UpdateFirewall(previousFirewall, current.firewall)
+	if err != nil {
+		return E.Cause(err, "set up the firewall")
+	}
+	if current.result.Dataplane.TakeDNS {
+		changed, err := s.options.System.TakeOverDNS()
+		if err != nil {
+			return E.Cause(err, "point the DNS of the LAN at the backend")
+		}
+		if changed {
+			s.log("info", "the DNS of the LAN asks the backend now")
+		}
+	} else {
+		// dont_touch_dhcp turned on while the backend had dnsmasq: it is given back now,
+		// not at the stop; a dnsmasq set by hand is not touched (dnsmasq.Restore)
+		changed, err := s.options.System.RestoreDNS()
+		if err != nil {
+			s.log("error", "give the DNS of the LAN back: ", err)
+		} else if changed {
+			s.log("info", "the DNS of the LAN is as it was before the backend: dont_touch_dhcp is on")
+		}
+	}
+	return nil
+}
+
+// firewallPlan makes the firewall table of a state: the rules from the settings, the
+// sets from what the rule sets hold now.
+func (s *Supervisor) firewallPlan(current *running) *firewall.Plan {
+	wanted := &current.result.Dataplane
+	result := &firewall.Plan{Interfaces: wanted.Interfaces, ExcludeNTP: wanted.ExcludeNTP, Sources: wanted.Sources}
+	var sources []lists.Source
+	for _, ruleSet := range current.result.RuleSets {
+		if ruleSet.Path != "" {
+			content, err := os.ReadFile(ruleSet.Path)
+			if err == nil {
+				sources = append(sources, lists.Source{Tag: ruleSet.Tag, Format: ruleSet.Format, Content: content})
+			}
+		} else if content, found := current.instance.RuleSetContent(ruleSet.Tag); found {
+			sources = append(sources, lists.Source{Tag: ruleSet.Tag, Format: ruleSet.Format, Content: content})
+		}
+	}
+	destinations, problems := s.deriveSets(sources)
+	for _, problem := range problems {
+		s.log("warn", "firewall sets: ", problem)
+	}
+	result.Subnets, result.Groups = destinations.Subnets, destinations.Groups
+	return result
+}
+
+// derivation is what the firewall sets were made of: the rule sets by tag, format and
+// content, and what came of them.
+type derivation struct {
+	keys         []derivationKey
+	destinations *lists.Destinations
+	problems     []error
+}
+
+type derivationKey struct {
+	tag    string
+	format string
+	sum    [sha256.Size]byte
+}
+
+type readRules struct {
+	rules []engine.AddressRule
+	err   error
+}
+
+// deriveSets is lists.Derive of rule sets with what was read of each kept: the sets of the
+// firewall are made at every apply and at every load of a rule set, and a big list read
+// for them again is a big list read once more. Only a rule set whose
+// content changed is read; when none did, the sets are those made last.
+func (s *Supervisor) deriveSets(sources []lists.Source) (*lists.Destinations, []error) {
+	keys := make([]derivationKey, len(sources))
+	for index, source := range sources {
+		keys[index] = derivationKey{source.Tag, source.Format, sha256.Sum256(source.Content)}
+	}
+	if s.derived != nil && slices.Equal(keys, s.derived.keys) {
+		return s.derived.destinations, s.derived.problems
+	}
+	if s.read == nil {
+		s.read = make(map[derivationKey]readRules)
+	}
+	// the tags of the rule sets of a configuration are its own each
+	keyOf := make(map[string]derivationKey, len(keys))
+	for _, key := range keys {
+		keyOf[key.tag] = key
+	}
+	used := make(map[derivationKey]bool, len(keys))
+	destinations, problems := lists.DeriveWith(sources, func(source lists.Source) ([]engine.AddressRule, error) {
+		key := keyOf[source.Tag]
+		used[key] = true
+		if found, known := s.read[key]; known {
+			return found.rules, found.err
+		}
+		rules, err := engine.RuleSetAddresses(source.Format, source.Content)
+		s.read[key] = readRules{rules, err}
+		return rules, err
+	})
+	for key := range s.read {
+		if !used[key] {
+			delete(s.read, key)
+		}
+	}
+	s.derived = &derivation{keys: keys, destinations: destinations, problems: problems}
+	return destinations, problems
+}
+
+// refreshFirewall brings the firewall to what the rule sets hold now.
+func (s *Supervisor) refreshFirewall() {
+	current := s.current
+	if current == nil {
+		return
+	}
+	next := s.firewallPlan(current)
+	err := s.options.System.UpdateFirewall(current.firewall, next)
+	if err != nil {
+		s.log("error", "update the firewall sets: ", err)
+		return
+	}
+	current.firewall = next
+}
+
+// Apply brings the router to the settings as they are now. Settings that cannot be used
+// change nothing: what runs keeps running. A configuration that is the same leaves
+// sing-box alone. Another configuration replaces it, and when the new one does not come
+// up the previous one is started again.
+func (s *Supervisor) Apply() Result {
+	if s.current == nil {
+		return s.Boot()
+	}
+	started := time.Now()
+	s.writeState(stateApplying)
+	next, err := s.prepare()
+	if err != nil {
+		s.log("error", "the settings cannot be used, nothing is changed: ", err)
+		return s.done(false, false, "the settings cannot be used, nothing is changed: ", err)
+	}
+	current := s.current
+	previousFirewall := current.firewall
+	if bytes.Equal(next.result.Config, current.result.Config) {
+		err = s.writeFiles(next.result, current.result)
+		if err != nil {
+			s.log("error", err)
+		}
+		// the path of the export may be what changed
+		s.storeConfig(next)
+		s.current = &running{settings: next.settings, result: next.result, instance: current.instance}
+		err = s.surround(previousFirewall)
+		if err != nil {
+			s.log("error", err)
+		}
+		s.log("info", "the settings are applied in ", time.Since(started).Milliseconds(), " ms, sing-box keeps running")
+		return s.done(true, false, "applied in ", time.Since(started).Milliseconds(), " ms, sing-box keeps running")
+	}
+	// another configuration. The cache file belongs to one instance at a time, so the
+	// running one is closed before the next is started.
+	closing := time.Now()
+	if !s.close(current.instance) {
+		return s.done(false, false, "sing-box does not close: the router is given back, the process has to end")
+	}
+	closed := time.Since(closing)
+	instance, err := s.start(next, current.result)
+	if err == nil {
+		s.current = &running{settings: next.settings, result: next.result, instance: instance}
+		err = s.surround(previousFirewall)
+		if err != nil {
+			s.log("error", err)
+		}
+		s.log("info", "the settings are applied in ", time.Since(started).Milliseconds(), " ms, sing-box runs the new configuration (it did not answer for ",
+			time.Since(closing).Milliseconds(), " ms, of which the previous one took ", closed.Milliseconds(), " ms to close)")
+		return s.done(true, true, "applied in ", time.Since(started).Milliseconds(), " ms, sing-box runs the new configuration")
+	}
+	if s.stuck {
+		return s.done(false, false, "the new configuration does not come up, and sing-box does not close: the router is given back, the process has to end")
+	}
+	s.log("error", "the new configuration does not come up, going back to the previous one: ", err)
+	s.keepConfig(RejectedConfig, next.result.Config)
+	failure := err
+	instance, err = s.start(&candidate{settings: current.settings, result: current.result}, next.result)
+	if err != nil {
+		s.log("error", "the previous configuration does not come up either: ", err)
+		s.current = nil
+		s.release()
+		return s.done(false, false, "the new configuration does not come up: ", failure, "; the previous one does not either: ", err)
+	}
+	s.current = &running{settings: current.settings, result: current.result, instance: instance}
+	err = s.surround(previousFirewall)
+	if err != nil {
+		s.log("error", err)
+	}
+	return s.done(false, true, "the new configuration does not come up, the previous one runs again: ", failure)
+}
+
+// Stop takes everything back. The DNS of the LAN first: whatever happens after, the
+// devices ask a resolver that answers.
+func (s *Supervisor) Stop() {
+	current := s.current
+	s.current = nil
+	s.release()
+	if current != nil {
+		s.close(current.instance)
+	}
+	s.removeFiles()
+	s.keepConfig(RejectedConfig, nil)
+	s.statusAccess.Lock()
+	s.status.Running = false
+	s.facts = api.Facts{}
+	s.statusAccess.Unlock()
+	s.writeState(stateStopped)
+}
+
+// compat: rule-set-files
+// removeFiles deletes the rule-set files. The shell backend, which may run after this
+// one, takes a rule-set file that is there for one it has already put into its
+// configuration, and writes a configuration without the lists.
+func (s *Supervisor) removeFiles() {
+	entries, err := os.ReadDir(s.options.RuleSetDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			_ = os.Remove(filepath.Join(s.options.RuleSetDir, entry.Name()))
+		}
+	}
+}
+
+// Release gives the router back what a backend that is gone left taken: one that was
+// killed, or one that ended before it could clean up. Nothing must run while it is
+// called. What is not there is no error.
+func (s *Supervisor) Release() {
+	s.release()
+	s.removeFiles()
+	s.keepConfig(RejectedConfig, nil)
+}
+
+// release gives the router back what the backend took: the DNS of the LAN, the firewall
+// table, the routing. Each is no error when it is not there. Nothing runs after it.
+func (s *Supervisor) release() {
+	s.keepConfig(RunningConfig, nil)
+	changed, err := s.options.System.RestoreDNS()
+	if err != nil {
+		s.log("error", "give the DNS of the LAN back: ", err)
+	} else if changed {
+		s.log("info", "the DNS of the LAN is as it was before the backend")
+	}
+	err = s.options.System.RemoveFirewall()
+	if err != nil {
+		s.log("error", "remove the firewall table: ", err)
+	}
+	err = s.options.System.RemoveRouting()
+	if err != nil {
+		s.log("error", "remove the routing: ", err)
+	}
+}
+
+// clashKey gives the Clash API a key when the settings have none: without one any device
+// of the LAN reads the connections and switches the outbounds. The key
+// is written into the settings, where the page reads it to send as its token. Settings
+// saved without it (the page drops the field while WAN access to YACD is off) get back
+// the key they had last, the one written before this process started included: the key
+// changes only when someone sets another. A key is made only when the settings had none
+// since the process started.
+func (s *Supervisor) clashKey(settings *model.Config) {
+	if settings.Settings.YACDSecretKey != "" {
+		s.clashSecret = settings.Settings.YACDSecretKey
+		return
+	}
+	made := false
+	if s.clashSecret == "" {
+		var random [16]byte
+		_, _ = rand.Read(random[:])
+		s.clashSecret = hex.EncodeToString(random[:])
+		made = true
+	}
+	settings.Settings.YACDSecretKey = s.clashSecret
+	err := s.options.System.SetClashSecret(s.clashSecret)
+	if err != nil {
+		s.log("warn", "write the key of the Clash API into the settings: ", err)
+		return
+	}
+	if made {
+		s.log("info", "the Clash API has a key now (podkop.settings.yacd_secret_key): a device of the LAN without it is refused")
+	}
+}
+
+// survive, deferred by a goroutine of a worker, turns a fault of it into a line of the log
+// (the stack goes to the standard error) and answers for it with answer: the backend
+// and the router stay up.
+func (s *Supervisor) survive(what string, answer func()) {
+	fault := recover()
+	if fault == nil {
+		return
+	}
+	os.Stderr.Write(debug.Stack())
+	s.log("error", "a fault of the backend in ", what, ": ", fault)
+	if answer != nil {
+		answer()
+	}
+}
+
+// oneLine keeps a message on one line of the log.
+func oneLine(message string) string {
+	return strings.Join(strings.Fields(message), " ")
+}

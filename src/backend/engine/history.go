@@ -1,0 +1,102 @@
+package engine
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"sync"
+
+	"github.com/sagernet/sing-box/common/urltest"
+	"github.com/sagernet/sing/service"
+)
+
+// history is the urltest history of the process: what the URL tests of the groups found,
+// by the tag of the outbound. sing-box makes one an instance unless its context has one,
+// and a group of a configuration that replaced another then took its first member until
+// its own first test, though the members had been tested a minute before. With one
+// history the group chooses at once, and its first test round passes
+// over the members tested within the interval, as it would have in the instance before.
+//
+// A result belongs to the outbound it was found for, not to its tag: the tag of a section
+// keeps its name when the link of the section changes. The results of the outbounds that
+// changed are forgotten at the start of the next configuration (forgetChanged), or a group
+// would take the delay of the server a tag had before for the one it has now, and would
+// not test that one for an interval.
+var history = &sharedHistory{storage: urltest.NewHistoryStorage()}
+
+type sharedHistory struct {
+	storage *urltest.HistoryStorage
+	access  sync.Mutex
+	// started are the dialers of the configuration started last; nil before the first
+	started map[string]dialer
+}
+
+// dialer is an outbound or an endpoint of a configuration as the history sees it.
+type dialer struct {
+	// content is the JSON object as the configuration has it
+	content []byte
+	// detour is the tag of the outbound it dials through, if any
+	detour string
+}
+
+// withHistory gives a context the history of the process.
+func withHistory(ctx context.Context) context.Context {
+	return service.ContextWithPtr(ctx, history.storage)
+}
+
+// dialersOf reads the outbounds and the endpoints of a configuration by tag. A
+// configuration that cannot be read has none: every result is forgotten then.
+func dialersOf(configuration []byte) map[string]dialer {
+	var parsed struct {
+		Outbounds []json.RawMessage `json:"outbounds"`
+		Endpoints []json.RawMessage `json:"endpoints"`
+	}
+	result := make(map[string]dialer)
+	if json.Unmarshal(configuration, &parsed) != nil {
+		return result
+	}
+	for _, content := range append(parsed.Outbounds, parsed.Endpoints...) {
+		var head struct {
+			Tag    string `json:"tag"`
+			Detour string `json:"detour"`
+		}
+		if json.Unmarshal(content, &head) != nil || head.Tag == "" {
+			continue
+		}
+		result[head.Tag] = dialer{content: content, detour: head.Detour}
+	}
+	return result
+}
+
+// forgetChanged is called before a configuration starts: the results of the dialers that
+// are not in it as they were in the configuration started before are forgotten, and of
+// those that dial through one of them. Nothing is forgotten at the first start of the
+// process: the history is empty then.
+func (h *sharedHistory) forgetChanged(next map[string]dialer) {
+	h.access.Lock()
+	defer h.access.Unlock()
+	previous := h.started
+	h.started = next
+	if previous == nil {
+		return
+	}
+	changed := make(map[string]bool)
+	for tag, before := range previous {
+		now, kept := next[tag]
+		if !kept || !bytes.Equal(before.content, now.content) {
+			changed[tag] = true
+		}
+	}
+	for grew := len(changed) > 0; grew; {
+		grew = false
+		for tag, now := range next {
+			if !changed[tag] && now.detour != "" && changed[now.detour] {
+				changed[tag] = true
+				grew = true
+			}
+		}
+	}
+	for tag := range changed {
+		h.storage.DeleteURLTestHistory(tag)
+	}
+}

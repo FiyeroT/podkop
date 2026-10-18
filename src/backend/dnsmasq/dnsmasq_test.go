@@ -1,0 +1,119 @@
+package dnsmasq
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+// router is a System that keeps what was done to it.
+type router struct {
+	settings   string
+	scripts    []string
+	restarts   int
+	resolvFile bool
+}
+
+func (r *router) ReadSettings() ([]byte, error) { return []byte(r.settings), nil }
+func (r *router) Batch(script string) error     { r.scripts = append(r.scripts, script); return nil }
+func (r *router) Restart() error                { r.restarts++; return nil }
+func (r *router) Exists(string) bool            { return r.resolvFile }
+
+func lines(script string) []string {
+	return strings.Split(strings.TrimSpace(script), "\n")
+}
+
+func TestTakeOver(t *testing.T) {
+	t.Parallel()
+	system := &router{settings: "config dnsmasq\n\toption cachesize '1000'\n\tlist server '8.8.8.8'\n\tlist server '/lan/192.168.1.1'\n\toption noresolv '0'\n"}
+	changed, err := TakeOver(system)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, 1, system.restarts)
+	require.Equal(t, []string{
+		"add_list dhcp.@dnsmasq[0].podkop_server='8.8.8.8'",
+		"add_list dhcp.@dnsmasq[0].podkop_server='/lan/192.168.1.1'",
+		"delete dhcp.@dnsmasq[0].server",
+		"set dhcp.@dnsmasq[0].podkop_noresolv='0'",
+		"set dhcp.@dnsmasq[0].podkop_cachesize='1000'",
+		"add_list dhcp.@dnsmasq[0].server='127.0.0.42'",
+		"set dhcp.@dnsmasq[0].noresolv='1'",
+		"set dhcp.@dnsmasq[0].cachesize='0'",
+		"set dhcp.@dnsmasq[0].podkop_taken='1'",
+		"commit dhcp",
+	}, lines(system.scripts[0]))
+
+	// a dnsmasq with nothing set: nothing to keep
+	system = &router{settings: "config dnsmasq\n\toption domain 'lan'\n"}
+	_, err = TakeOver(system)
+	require.NoError(t, err)
+	require.Equal(t, []string{"add_list dhcp.@dnsmasq[0].server='127.0.0.42'", "set dhcp.@dnsmasq[0].noresolv='1'", "set dhcp.@dnsmasq[0].cachesize='0'",
+		"set dhcp.@dnsmasq[0].podkop_taken='1'", "commit dhcp"}, lines(system.scripts[0]))
+
+	// it asks the backend already: nothing is done, dnsmasq is not restarted
+	system = &router{settings: "config dnsmasq\n\tlist server '127.0.0.42'\n\toption noresolv '1'\n\toption cachesize '0'\n\tlist podkop_server '8.8.8.8'\n"}
+	changed, err = TakeOver(system)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Empty(t, system.scripts)
+	require.Zero(t, system.restarts)
+
+	_, err = TakeOver(&router{settings: "config dhcp 'lan'\n"})
+	require.Error(t, err)
+}
+
+func TestRestore(t *testing.T) {
+	t.Parallel()
+	system := &router{settings: "config dnsmasq\n\tlist server '127.0.0.42'\n\toption noresolv '1'\n\toption cachesize '0'\n\tlist podkop_server '8.8.8.8'\n\tlist podkop_server '9.9.9.9'\n\toption podkop_noresolv '1'\n\toption podkop_cachesize '1000'\n"}
+	changed, err := Restore(system)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, 1, system.restarts)
+	require.Equal(t, []string{
+		"set dhcp.@dnsmasq[0].cachesize='1000'",
+		"delete dhcp.@dnsmasq[0].podkop_cachesize",
+		"set dhcp.@dnsmasq[0].noresolv='1'",
+		"delete dhcp.@dnsmasq[0].podkop_noresolv",
+		"delete dhcp.@dnsmasq[0].server",
+		"add_list dhcp.@dnsmasq[0].server='8.8.8.8'",
+		"add_list dhcp.@dnsmasq[0].server='9.9.9.9'",
+		"delete dhcp.@dnsmasq[0].podkop_server",
+		"commit dhcp",
+	}, lines(system.scripts[0]))
+
+	// taken over with nothing to keep: the resolvers netifd collects, and dnsmasq told to
+	// read them
+	system = &router{resolvFile: true, settings: "config dnsmasq\n\tlist server '127.0.0.42'\n\toption noresolv '1'\n\toption cachesize '0'\n\toption podkop_taken '1'\n"}
+	_, err = Restore(system)
+	require.NoError(t, err)
+	require.Equal(t, []string{"delete dhcp.@dnsmasq[0].podkop_taken", "set dhcp.@dnsmasq[0].cachesize='150'", "set dhcp.@dnsmasq[0].noresolv='0'", "delete dhcp.@dnsmasq[0].server",
+		"set dhcp.@dnsmasq[0].resolvfile='/tmp/resolv.conf.d/resolv.conf.auto'", "commit dhcp"}, lines(system.scripts[0]))
+
+	// set by hand to ask the backend (dont_touch_dhcp), with nothing kept and no marker:
+	// it is the user's setting, and it stays
+	system = &router{resolvFile: true, settings: "config dnsmasq\n\tlist server '127.0.0.42'\n\toption noresolv '1'\n\toption cachesize '0'\n"}
+	changed, err = Restore(system)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Empty(t, system.scripts)
+
+	// it was told not to read the resolvers and has no servers kept
+	system = &router{resolvFile: true, settings: "config dnsmasq\n\tlist server '127.0.0.42'\n\toption noresolv '1'\n\toption cachesize '0'\n\toption podkop_noresolv '1'\n"}
+	_, err = Restore(system)
+	require.NoError(t, err)
+	require.Contains(t, lines(system.scripts[0]), "set dhcp.@dnsmasq[0].noresolv='0'")
+
+	// a dnsmasq the backend never touched is left alone
+	system = &router{settings: "config dnsmasq\n\tlist server '8.8.8.8'\n\toption cachesize '1000'\n"}
+	changed, err = Restore(system)
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.Empty(t, system.scripts)
+	require.Zero(t, system.restarts)
+}
+
+func TestQuote(t *testing.T) {
+	t.Parallel()
+	require.Equal(t, `'/it'\''s/1.2.3.4'`, quote("/it's/1.2.3.4"))
+}

@@ -1,0 +1,368 @@
+package plan
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/itdoginfo/podkop/src/backend/model"
+	E "github.com/sagernet/sing/common/exceptions"
+)
+
+// The generator wrote what the shell backend of podkop 0.7.24 writes, byte for byte, and
+// the cases of render/testdata hold what the shell backend wrote. Where the generator
+// differs on purpose, the difference is listed here, and
+// FromShell brings a configuration of the shell backend to what the generator writes
+// instead, so that every case still checks the rest byte for byte:
+//
+//  1. Remote rule sets download with one named HTTP client, "lists", with a detour to the
+//     outbound of the section the settings name for the lists, or without one, and
+//     route.default_http_client names it. The shell backend gives each rule set
+//     download_detour, or nothing (the implicit default client): sing-box 1.14 notes
+//     both as deprecated, and 1.16 removes them.
+//  2. A list given by URL that is no rule set file is a remote rule set of the format
+//     text, a URL each, downloaded by sing-box (common/ruletext); those of a section and
+//     kind come together, where the first of them is. The shell backend downloads such
+//     lists itself into one local rule set file of the section and kind.
+//  3. No inbound service-mixed-in (port 4534) and no route rule of it: it was the proxy
+//     the backend's own downloads went through, and the backend downloads nothing now.
+//  4. What a list is, is told by the extension of the path of its URL, whatever its case
+//     and without the query (list.json?raw=1 and LIST.SRS are rule set files; the shell
+//     backend took both for plain lists), and two lists of one name in a section and kind
+//     get numbers (the shell backend gives them one tag, and sing-box refuses the
+//     configuration).
+//  5. A list that is a file of the router is a local rule set of sing-box, a file each, in
+//     the format of its extension: sing-box reads the file and reads it again when it
+//     changes. The shell backend copies the files of a section and kind into one rule set
+//     file at its start, its own way (the last line without a line end lost, a thousand
+//     items at a time). A file sing-box cannot read stands as an empty rule set file.
+//  6. No dns.independent_cache: the cache of sing-box 1.14 keeps the answers of each server
+//     apart anyway, the option is deprecated and 1.16 removes it.
+//  7. The Clash API has the key of the settings whenever there is one, YACD on or not;
+//     the shell backend gives it only with YACD.
+
+// Shell is what FromShell has to know besides the configuration: the settings it was made
+// of, and how the generator reads and names the local lists (Options: RuleSetDir,
+// ReadFile, CheckList, LocalPath).
+type Shell struct {
+	Settings *model.Config
+	Options  Options
+}
+
+// Converted is a configuration of the shell backend as the generator writes it.
+type Converted struct {
+	Config []byte
+	// Dropped are rule-set files of the shell backend the generator does not write, by
+	// name; Added are those it writes and the shell backend does not, by name.
+	Dropped []string
+	Added   map[string][]byte
+}
+
+// FromShell returns a configuration the shell backend wrote as the generator writes it,
+// the differences above applied.
+func FromShell(content []byte, shell Shell) (*Converted, error) {
+	value, err := parseValue(content)
+	if err != nil {
+		return nil, err
+	}
+	document, isObject := value.(*object)
+	if !isObject {
+		return &Converted{Config: content}, nil
+	}
+	options := shell.Options
+	if options.RuleSetDir == "" {
+		options.RuleSetDir = DefaultRuleSetDir
+	}
+	converted := &Converted{Added: make(map[string][]byte)}
+	removeServiceProxy(document)
+	if dns, _ := document.get("dns"); dns != nil {
+		if dnsObject, isObject := dns.(*object); isObject {
+			dnsObject.remove("independent_cache")
+		}
+	}
+	route, _ := document.get("route")
+	routeObject, _ := route.(*object)
+	if routeObject != nil && shell.Settings != nil {
+		ruleSets, _ := routeObject.get("rule_set")
+		list, _ := ruleSets.([]any)
+		var detour any
+		for _, entry := range list {
+			if ruleSet, isObject := entry.(*object); isObject {
+				if value, found := ruleSet.get("download_detour"); found {
+					detour = value
+					ruleSet.remove("download_detour")
+				}
+			}
+		}
+		for index := range shell.Settings.Sections {
+			section := &shell.Settings.Sections[index]
+			for _, kind := range []string{"domains", "subnets"} {
+				// the files of the router
+				locals := listEntries(section.Name, kind, localLocations(section, kind), true)
+				if len(locals) > 0 {
+					oldTag := ruleSetTag(section.Name, "local", kind)
+					var replacement []any
+					var newTags []string
+					for _, entry := range locals {
+						newTags = append(newTags, entry.tag)
+						if usableLocalList(entry, options) {
+							replacement = append(replacement, newObject("type", "local", "tag", entry.tag, "format", entry.format, "path", localPathOf(entry.location, options)))
+							continue
+						}
+						path := options.RuleSetDir + "/" + entry.tag + ".json"
+						replacement = append(replacement, newObject("type", "local", "tag", entry.tag, "format", "source", "path", path))
+						empty, err := indented(newObject("version", versionSourceRuleSet, "rules", []any{}))
+						if err != nil {
+							return nil, err
+						}
+						converted.Added[entry.tag+".json"] = empty
+					}
+					list, err = replaceSpan(list, []string{oldTag}, replacement)
+					if err != nil {
+						return nil, E.Cause(err, "section ", section.Name, ", local ", kind)
+					}
+					converted.Dropped = append(converted.Dropped, oldTag+".json")
+					replaceReferences(document, []string{oldTag}, newTags)
+				}
+				// the lists given by URL
+				locations := remoteLocations(section, kind)
+				if len(locations) > 0 {
+					oldTags, plain := shellRemoteTags(section.Name, kind, locations)
+					var replacement []any
+					var newTags []string
+					for _, entry := range remoteOrder(listEntries(section.Name, kind, locations, false)) {
+						newTags = append(newTags, entry.tag)
+						replacement = append(replacement, newObject("type", "remote", "tag", entry.tag, "format", entry.format, "url", entry.location,
+							"update_interval", shell.Settings.Settings.UpdateInterval))
+					}
+					list, err = replaceSpan(list, oldTags, replacement)
+					if err != nil {
+						return nil, E.Cause(err, "section ", section.Name, ", remote ", kind)
+					}
+					if plain {
+						converted.Dropped = append(converted.Dropped, ruleSetTag(section.Name, "remote", kind)+".json")
+					}
+					replaceReferences(document, oldTags, newTags)
+				}
+			}
+		}
+		routeObject.set("rule_set", list)
+		remote := false
+		for _, entry := range list {
+			if ruleSet, isObject := entry.(*object); isObject {
+				if kind, _ := ruleSet.get("type"); kind == "remote" {
+					remote = true
+				}
+			}
+		}
+		if remote {
+			if detour == nil && shell.Settings.Settings.DownloadListsViaProxy {
+				// a configuration whose only downloaded lists were plain ones had no
+				// download_detour to take the section from
+				detour = outboundTag(shell.Settings.Settings.DownloadListsViaProxySection)
+			}
+			client := newObject("tag", tagListsHTTPClient)
+			if detour != nil {
+				client.set("detour", detour)
+			}
+			document.insertAfter("certificate", "http_clients", []any{client})
+			routeObject.set("default_http_client", tagListsHTTPClient)
+		}
+	}
+	if shell.Settings != nil && shell.Settings.Settings.YACDSecretKey != "" {
+		if experimental, _ := document.get("experimental"); experimental != nil {
+			if experimentalObject, isObject := experimental.(*object); isObject {
+				if clashAPI, _ := experimentalObject.get("clash_api"); clashAPI != nil {
+					if clashAPIObject, isObject := clashAPI.(*object); isObject {
+						clashAPIObject.set("secret", shell.Settings.Settings.YACDSecretKey)
+					}
+				}
+			}
+		}
+	}
+	converted.Config, err = indented(document)
+	if err != nil {
+		return nil, err
+	}
+	return converted, nil
+}
+
+// shellRemoteTags are the tags the shell backend gives the remote lists of a section and
+// kind, in their order: a list is a rule set file when the text after the last dot of the
+// URL is "json" or "srs" exactly, query and all; the others go into one file of the
+// section and kind, which is told too.
+func shellRemoteTags(section string, kind string, locations []string) ([]string, bool) {
+	var tags []string
+	plain := false
+	for _, location := range locations {
+		fileName := location[strings.LastIndexByte(location, '/')+1:]
+		var extension string
+		if dot := strings.LastIndexByte(fileName, '.'); dot >= 0 {
+			extension = fileName[dot+1:]
+		}
+		if extension == "json" || extension == "srs" {
+			baseName, _, _ := strings.Cut(fileName, ".")
+			tags = append(tags, ruleSetTag(section, baseName, "remote-"+kind))
+			continue
+		}
+		if !plain {
+			plain = true
+			tags = append(tags, ruleSetTag(section, "remote", kind))
+		}
+	}
+	return tags, plain
+}
+
+func usableLocalList(entry listEntry, options Options) bool {
+	if options.ReadFile == nil {
+		return false
+	}
+	content, err := options.ReadFile(entry.location)
+	if err != nil {
+		return false
+	}
+	if options.CheckList == nil {
+		return true
+	}
+	_, _, err = options.CheckList(entry.format, content)
+	return err == nil
+}
+
+func localPathOf(path string, options Options) string {
+	if options.LocalPath == nil {
+		return path
+	}
+	return options.LocalPath(path)
+}
+
+// removeServiceProxy removes the proxy inbound of the shell backend's downloads, told by
+// its port (a section named "service" has a mixed inbound of that tag too), and the
+// route rule of it.
+func removeServiceProxy(document *object) {
+	inbounds, _ := document.get("inbounds")
+	list, _ := inbounds.([]any)
+	removed := false
+	kept := list[:0:0]
+	for _, entry := range list {
+		if inbound, isObject := entry.(*object); isObject {
+			tag, _ := inbound.get("tag")
+			port, _ := inbound.get("listen_port")
+			if tag == "service-mixed-in" && fmt.Sprint(port) == "4534" {
+				removed = true
+				continue
+			}
+		}
+		kept = append(kept, entry)
+	}
+	if !removed {
+		return
+	}
+	document.set("inbounds", kept)
+	route, _ := document.get("route")
+	routeObject, _ := route.(*object)
+	if routeObject == nil {
+		return
+	}
+	rules, _ := routeObject.get("rules")
+	ruleList, _ := rules.([]any)
+	keptRules := ruleList[:0:0]
+	for _, entry := range ruleList {
+		if rule, isObject := entry.(*object); isObject {
+			if inbound, _ := rule.get("inbound"); inbound == "service-mixed-in" {
+				continue
+			}
+		}
+		keptRules = append(keptRules, entry)
+	}
+	routeObject.set("rules", keptRules)
+}
+
+// replaceSpan puts entries in place of the rule sets of the tags, which stand one after
+// another in the list.
+func replaceSpan(list []any, tags []string, entries []any) ([]any, error) {
+	if len(tags) == 0 {
+		return list, nil
+	}
+	start := -1
+	for index, entry := range list {
+		if ruleSet, isObject := entry.(*object); isObject {
+			if tag, _ := ruleSet.get("tag"); tag == tags[0] {
+				start = index
+				break
+			}
+		}
+	}
+	if start < 0 || start+len(tags) > len(list) {
+		return nil, E.New("the rule sets ", strings.Join(tags, ", "), " are not in the configuration")
+	}
+	for offset, want := range tags {
+		ruleSet, _ := list[start+offset].(*object)
+		if ruleSet == nil {
+			return nil, E.New("the rule sets ", strings.Join(tags, ", "), " do not stand together")
+		}
+		if tag, _ := ruleSet.get("tag"); tag != want {
+			return nil, E.New("the rule sets ", strings.Join(tags, ", "), " do not stand together")
+		}
+	}
+	result := append(append(append([]any{}, list[:start]...), entries...), list[start+len(tags):]...)
+	return result, nil
+}
+
+// replaceReferences puts tags in place of others in the rule_set of the route and DNS
+// rules: where the old ones stand one after another, a name alone when one is left, a
+// list otherwise, as patch makes it.
+func replaceReferences(document *object, oldTags []string, newTags []string) {
+	if len(oldTags) == 0 {
+		return
+	}
+	for _, key := range []string{"route", "dns"} {
+		holder, _ := document.get(key)
+		holderObject, _ := holder.(*object)
+		if holderObject == nil {
+			continue
+		}
+		rules, _ := holderObject.get("rules")
+		ruleList, _ := rules.([]any)
+		for _, entry := range ruleList {
+			rule, isObject := entry.(*object)
+			if !isObject {
+				continue
+			}
+			value, found := rule.get("rule_set")
+			if !found {
+				continue
+			}
+			var current []any
+			switch typed := value.(type) {
+			case string:
+				current = []any{typed}
+			case []any:
+				current = typed
+			default:
+				continue
+			}
+			start := -1
+			for index := 0; index+len(oldTags) <= len(current); index++ {
+				matches := true
+				for offset, tag := range oldTags {
+					if current[index+offset] != tag {
+						matches = false
+						break
+					}
+				}
+				if matches {
+					start = index
+					break
+				}
+			}
+			if start < 0 {
+				continue
+			}
+			replaced := append(append(append([]any{}, current[:start]...), stringsToAny(newTags)...), current[start+len(oldTags):]...)
+			if len(replaced) == 1 {
+				rule.set("rule_set", replaced[0])
+			} else {
+				rule.set("rule_set", replaced)
+			}
+		}
+	}
+}

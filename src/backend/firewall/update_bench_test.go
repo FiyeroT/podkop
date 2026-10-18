@@ -1,0 +1,27 @@
+package firewall
+
+import (
+	"net/netip"
+	"testing"
+)
+
+// What a change of one address costs besides the kernel when a list of 100000 subnets is
+// in the set: the two lists merged and their difference worked out (the update merges only
+// the next one: the previous plan keeps its ranges). Run with -cpuprofile
+// and -memprofile to see where it goes.
+func BenchmarkOneAddressMore(b *testing.B) {
+	var previous []netip.Prefix
+	for index := 0; index < 100000; index++ {
+		previous = append(previous, netip.PrefixFrom(netip.AddrFrom4([4]byte{11 + byte(index/32768), byte(index / 128), byte(index%128) * 2, 0}), 24))
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		next := append(append([]netip.Prefix{}, previous...), netip.MustParsePrefix("100.71.99.8/32"))
+		gone, came := rangesDiffer(merge(previous), merge(next))
+		if len(gone) != 0 || len(came) != 1 {
+			b.Fatal(len(gone), len(came))
+		}
+		_ = intervals(came)
+	}
+}

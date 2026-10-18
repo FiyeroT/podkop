@@ -1,0 +1,124 @@
+package diag
+
+import (
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+)
+
+func TestMaskSettings(t *testing.T) {
+	t.Parallel()
+	settings := `config settings 'settings'
+	option dns_type 'doh'
+	option dns_server 'dns.nextdns.io/abc123'
+	option yacd_secret_key 's3cret'
+	option log_level 'warn'
+
+config section 'main'
+	option proxy_string 'vless://uuid@host:443?x=1#name'
+	option user_domains_text 'a.example
+b.example'
+	list selector_proxy_links 'trojan://p@h:1'
+	list selector_proxy_links 'ss://x@h:2'
+	list urltest_proxy_links 'vless://u@h:3'
+	list urltest_fallback_links 'socks5://u:p@h:4'
+	option outbound_json '{
+  "type": "socks",
+  "password": "it'\''s"
+}'
+	option interface 'wg0'
+
+config section 'vpn'
+	option domain_resolver_dns_server 'dns.example.org/secret-path?x'
+	option outbound_json '{"type":"direct"}'
+	option proxy_string 'trojan://first
+vless://second'
+	option after 'kept'
+`
+	masked := MaskSettings([]byte(settings))
+	for _, secret := range []string{"abc123", "s3cret", "uuid@host", "trojan://", "ss://", "socks5://", "vless://", "password", "secret-path", `"type"`} {
+		require.NotContains(t, masked, secret)
+	}
+	require.Equal(t, `config settings 'settings'
+	option dns_type 'doh'
+	option dns_server 'dns.nextdns.io/MASKED'
+	option yacd_secret_key 'MASKED'
+	option log_level 'warn'
+
+config section 'main'
+	option proxy_string 'MASKED'
+	option user_domains_text 'a.example
+b.example'
+	list selector_proxy_links 'MASKED'
+	list selector_proxy_links 'MASKED'
+	list urltest_proxy_links 'MASKED'
+	list urltest_fallback_links 'MASKED'
+	option outbound_json 'MASKED'
+	option interface 'wg0'
+
+config section 'vpn'
+	option domain_resolver_dns_server 'dns.example.org/MASKED'
+	option outbound_json 'MASKED'
+	option proxy_string 'MASKED'
+	option after 'kept'
+`, masked)
+}
+
+func TestMaskConfig(t *testing.T) {
+	t.Parallel()
+	masked, err := MaskConfig([]byte(`{"outbounds":[{"type":"vless","tag":"main-out","server":"203.0.113.10","server_port":443,"uuid":"u","tls":{"enabled":true,"server_name":"x","utls":{"fingerprint":"chrome"},"reality":{"public_key":"k","short_id":"01"}}},{"type":"trojan","password":"p"}],"dns":{"servers":[{"type":"udp","server":"8.8.8.8","server_port":53}]}}`))
+	require.NoError(t, err)
+	text := string(masked)
+	for _, secret := range []string{"203.0.113.10", "443", `"u"`, `"x"`, "chrome", `"k"`, `"01"`, `"p"`, "8.8.8.8"} {
+		require.NotContains(t, text, secret)
+	}
+	require.Contains(t, text, `"tag": "main-out"`)
+	require.Equal(t, 10, strings.Count(text, `"MASKED"`))
+
+	// the credentials an outbound or an endpoint may carry besides, the path of a DoH
+	// server and the secret of the Clash API; the same keys elsewhere are kept
+	masked, err = MaskConfig([]byte(`{
+		"dns": {"servers": [{"type": "https", "tag": "dns-server", "server": "dns.example.org", "path": "/abc123"}]},
+		"outbounds": [
+			{"type": "vless", "tag": "a", "encryption": "mlkem768x25519plus.native.0rtt.secret-e", "transport": {"type": "xhttp", "path": "/xh", "headers": {"X-Token": "secret-h"}, "extra": {"xPaddingBytes": "secret-x"}}},
+			{"type": "socks", "tag": "b", "username": "secret-u"},
+			{"type": "hysteria", "tag": "c", "auth_str": "secret-a", "obfs": "secret-o"},
+			{"type": "shadowsocks", "tag": "d", "plugin": "obfs-local", "plugin_opts": "obfs=http;obfs-host=secret-p"},
+			{"type": "ssh", "tag": "e", "user": "secret-s", "private_key": "secret-k", "private_key_passphrase": "secret-q"}
+		],
+		"endpoints": [{"type": "wireguard", "tag": "f", "private_key": "secret-w", "peers": [{"public_key": "pk", "pre_shared_key": "secret-r"}]}],
+		"route": {"rule_set": [{"type": "local", "tag": "g", "format": "source", "path": "/tmp/sing-box/rulesets/g.json"}]},
+		"experimental": {"clash_api": {"external_controller": "192.168.1.1:9090", "secret": "secret-c"}}
+	}`))
+	require.NoError(t, err)
+	text = string(masked)
+	require.NotContains(t, text, "secret-")
+	require.NotContains(t, text, "abc123")
+	for _, kept := range []string{`"path": "/xh"`, `"path": "/tmp/sing-box/rulesets/g.json"`, `"plugin": "obfs-local"`, `"external_controller": "192.168.1.1:9090"`, `"type": "xhttp"`} {
+		require.Contains(t, text, kept)
+	}
+}
+
+func TestListens(t *testing.T) {
+	// the tables of this very host: a TCP listener and a UDP socket of the test
+	if _, err := os.Stat("/proc/net/tcp"); err != nil {
+		t.Skip("no /proc/net")
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer listener.Close()
+	port := uint16(listener.Addr().(*net.TCPAddr).Port)
+	require.True(t, listens("/proc/net/tcp", net.IPv4(127, 0, 0, 1), port, "0A"))
+	require.False(t, listens("/proc/net/tcp", net.IPv4(127, 0, 0, 2), port, "0A"))
+	packets, err := net.ListenPacket("udp", "127.0.0.42:0")
+	require.NoError(t, err)
+	defer packets.Close()
+	udpPort := uint16(packets.LocalAddr().(*net.UDPAddr).Port)
+	require.True(t, listens("/proc/net/udp", net.IPv4(127, 0, 0, 42), udpPort, ""))
+	require.False(t, listens("/proc/net/udp", net.IPv4(127, 0, 0, 1), udpPort, ""))
+	require.False(t, listens(filepath.Join(t.TempDir(), "none"), net.IPv4(127, 0, 0, 1), port, ""))
+}

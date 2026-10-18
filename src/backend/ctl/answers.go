@@ -1,0 +1,76 @@
+package ctl
+
+import "github.com/itdoginfo/podkop/src/backend/diag"
+
+// compat: page-answers
+// The answers of the checks in the shapes the shell backend printed: the names and the
+// order of the fields, and a flag as a number, 0 or 1. The user interface of podkop 0.7
+// reads them; a typed API would print diag's values as they are.
+
+type firewallAnswer struct {
+	TableExist                int `json:"table_exist"`
+	RulesMangleExist          int `json:"rules_mangle_exist"`
+	RulesMangleCounters       int `json:"rules_mangle_counters"`
+	RulesMangleOutputExist    int `json:"rules_mangle_output_exist"`
+	RulesMangleOutputCounters int `json:"rules_mangle_output_counters"`
+	RulesProxyExist           int `json:"rules_proxy_exist"`
+	RulesProxyCounters        int `json:"rules_proxy_counters"`
+	RulesOtherMarkExist       int `json:"rules_other_mark_exist"`
+}
+
+func answerFirewall(found *diag.Firewall) firewallAnswer {
+	return firewallAnswer{
+		TableExist:       asNumber(found.Table),
+		RulesMangleExist: asNumber(found.Mangle), RulesMangleCounters: asNumber(found.MangleCounted),
+		RulesMangleOutputExist: asNumber(found.MangleOutput), RulesMangleOutputCounters: asNumber(found.MangleOutputCounted),
+		RulesProxyExist: asNumber(found.Proxy), RulesProxyCounters: asNumber(found.ProxyCounted),
+		RulesOtherMarkExist: asNumber(len(found.ForeignMarks) > 0),
+	}
+}
+
+// singBoxAnswer has what the shell backend checked of a sing-box package and service of
+// its own: here they are a part of the backend, and so always there.
+type singBoxAnswer struct {
+	Installed        int `json:"sing_box_installed"`
+	VersionOK        int `json:"sing_box_version_ok"`
+	ServiceExist     int `json:"sing_box_service_exist"`
+	AutostartDisable int `json:"sing_box_autostart_disabled"`
+	ProcessRunning   int `json:"sing_box_process_running"`
+	PortsListening   int `json:"sing_box_ports_listening"`
+}
+
+func answerSingBox(found *diag.SingBox) singBoxAnswer {
+	return singBoxAnswer{Installed: 1, VersionOK: 1, ServiceExist: 1, AutostartDisable: 1, ProcessRunning: asNumber(found.Running), PortsListening: asNumber(found.Listening)}
+}
+
+// DNSAnswer is the answer of check_dns_available.
+type DNSAnswer struct {
+	DNSType            string `json:"dns_type"`
+	DNSServer          string `json:"dns_server"`
+	DNSStatus          int    `json:"dns_status"`
+	DNSOnRouter        int    `json:"dns_on_router"`
+	BootstrapDNSServer string `json:"bootstrap_dns_server"`
+	BootstrapDNSStatus int    `json:"bootstrap_dns_status"`
+	DHCPConfigStatus   int    `json:"dhcp_config_status"`
+}
+
+// AnswerDNS is the answer of check_dns_available to what the check found.
+func AnswerDNS(found *diag.DNS) DNSAnswer {
+	return DNSAnswer{
+		DNSType: found.Type, DNSServer: found.Server, DNSStatus: asNumber(found.ServerAnswers), DNSOnRouter: asNumber(found.RouterAnswers),
+		BootstrapDNSServer: found.Bootstrap, BootstrapDNSStatus: asNumber(found.BootstrapAnswers), DHCPConfigStatus: asNumber(found.DHCPAsksBackend),
+	}
+}
+
+type systemAnswer struct {
+	PodkopVersion       string `json:"podkop_version"`
+	PodkopLatestVersion string `json:"podkop_latest_version"`
+	LuCIAppVersion      string `json:"luci_app_version"`
+	SingBoxVersion      string `json:"sing_box_version"`
+	OpenWrtVersion      string `json:"openwrt_version"`
+	DeviceModel         string `json:"device_model"`
+}
+
+func answerSystem(found *diag.System) systemAnswer {
+	return systemAnswer(*found)
+}

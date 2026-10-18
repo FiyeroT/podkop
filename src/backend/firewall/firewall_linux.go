@@ -1,0 +1,730 @@
+// Package firewall keeps the nftables table of the backend over netlink, without the nft
+// program: the table, the sets, the chains and the rules the shell backend of podkop
+// makes with some forty runs of nft, and the filling of the set of subnets.
+//
+// The table is the one that backend makes, rule by rule: `nft list table` prints the same
+// text for both (the test compares them).
+package firewall
+
+import (
+	"cmp"
+	"encoding/binary"
+	"fmt"
+	"math"
+	"net/netip"
+	"slices"
+	"strconv"
+	"strings"
+
+	"github.com/itdoginfo/podkop/src/backend/dataplane"
+	"github.com/sagernet/nftables"
+	"github.com/sagernet/nftables/binaryutil"
+	"github.com/sagernet/nftables/expr"
+	E "github.com/sagernet/sing/common/exceptions"
+
+	"go4.org/netipx"
+	"golang.org/x/sys/unix"
+)
+
+const (
+	tableName     = dataplane.FirewallTable
+	SetLocal      = "localv4"
+	SetSubnets    = "podkop_subnets"
+	SetInterfaces = "interfaces"
+
+	markProxy    = dataplane.ProxyMark
+	markOutbound = 0x00200000
+	portTProxy   = dataplane.TProxyPort
+	// the bit of a connection's status that says its destination was rewritten
+	// (IPS_DST_NAT of the kernel's nf_conntrack_common.h)
+	statusDNAT = 1 << 5
+)
+
+// the numbers the sets go by inside the transaction that makes them
+const (
+	idLocal = iota + 1
+	idSubnets
+	idInterfaces
+	// the sets of the groups take the numbers after these
+)
+
+var (
+	rangeFakeIP  = dataplane.FakeIPPrefix
+	addressProxy = netip.MustParseAddr(dataplane.TProxyAddress)
+	// what never goes to the proxy from the router itself
+	localRanges = []netipx.IPRange{
+		netipx.RangeOfPrefix(netip.MustParsePrefix("0.0.0.0/8")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("10.0.0.0/8")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("127.0.0.0/8")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("169.254.0.0/16")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("172.16.0.0/12")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("192.0.0.0/24")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("192.0.2.0/24")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("192.88.99.0/24")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("192.168.0.0/16")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("198.51.100.0/24")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("203.0.113.0/24")),
+		netipx.RangeOfPrefix(netip.MustParsePrefix("224.0.0.0/4")),
+		netipx.IPRangeFrom(netip.MustParseAddr("240.0.0.0"), netip.MustParseAddr("255.255.255.255")),
+	}
+)
+
+// Plan is the whole table: what its rules depend on and what its sets hold.
+type Plan struct {
+	// Interfaces are the interfaces traffic is taken from.
+	Interfaces []string
+	// ExcludeNTP leaves UDP port 123 alone.
+	ExcludeNTP bool
+	// Sources are devices of the LAN whose traffic goes to the proxy whatever its
+	// destination is, the local networks excepted.
+	Sources []netip.Prefix
+	// Subnets are the destinations that go to the proxy by address.
+	Subnets []netip.Prefix
+	// Groups are destinations that go to the proxy only for some ports.
+	Groups []Group
+
+	// the ranges of Subnets, merged once (rangesOf)
+	subnets merged
+}
+
+// merged keeps the ranges a list of prefixes merged into: a plan that is the previous one of
+// an update has them from when it was the next one.
+type merged struct {
+	done   bool
+	ranges []netipx.IPRange
+}
+
+func (m *merged) of(prefixes []netip.Prefix) []netipx.IPRange {
+	if !m.done {
+		m.ranges, m.done = merge(prefixes), true
+	}
+	return m.ranges
+}
+
+// Group is a set of destinations with a condition of its own.
+type Group struct {
+	// Set is the name of the nftables set.
+	Set string
+	// Protocol is unix.IPPROTO_UDP or unix.IPPROTO_TCP.
+	Protocol byte
+	// Ports are the destination ports the group is about.
+	Ports    []PortRange
+	Prefixes []netip.Prefix
+
+	prefixes merged
+}
+
+// PortRange is a range of ports, both ends included.
+type PortRange struct {
+	From uint16
+	To   uint16
+}
+
+// structure tells the rules of two plans apart: everything but what the sets hold.
+func (p *Plan) structure() string {
+	var text strings.Builder
+	fmt.Fprint(&text, p.Interfaces, p.ExcludeNTP, p.Sources)
+	for _, group := range p.Groups {
+		fmt.Fprint(&text, group.Set, group.Protocol, group.Ports)
+	}
+	return text.String()
+}
+
+// Update brings the table from what a previous call made to the plan. Rules that changed
+// replace the table whole; a set that changed is brought to its new content by what
+// differs (updateSet), with the rules left as they are, counters included. With no
+// previous plan the table is made anew, whatever is there.
+func Update(previous *Plan, next *Plan) error {
+	if previous == nil || previous.structure() != next.structure() {
+		return Apply(next)
+	}
+	err := updateSet(SetSubnets, previous.subnets.of(previous.Subnets), next.subnets.of(next.Subnets))
+	if err != nil {
+		return err
+	}
+	for index := range next.Groups {
+		before, after := &previous.Groups[index], &next.Groups[index]
+		err = updateSet(after.Set, before.prefixes.of(before.Prefixes), after.prefixes.of(after.Prefixes))
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// fillLot is the most ranges a set takes in one transaction when it is filled whole. The
+// kernel holds a transaction until it is committed, and the netlink library holds the
+// messages of one until it is sent: a set of a hundred thousand ranges filled at once
+// took a router with 128 MB to the OOM killer. A set of no more
+// ranges than this is filled at once, a packet seeing it whole or not at all; a bigger
+// one is half filled for a moment.
+const fillLot = 10000
+
+// updateSet brings a set from the ranges it was filled with to the next ones by what
+// differs: the ranges that went are deleted and the ranges that came are added, in one
+// transaction, so that a change of a few items is a few elements however big the set
+// is, and a packet sees the old set or the new one. A change of more than fillLot ranges,
+// or a set the kernel does not have as the previous ranges say, is filled anew.
+func updateSet(name string, before []netipx.IPRange, after []netipx.IPRange) error {
+	if slices.Equal(before, after) {
+		return nil
+	}
+	gone, came := rangesDiffer(before, after)
+	if len(gone)+len(came) <= fillLot {
+		conn, err := nftables.New()
+		if err != nil {
+			return E.Cause(err, "open netlink")
+		}
+		set := &nftables.Set{Table: &nftables.Table{Name: tableName, Family: nftables.TableFamilyINet}, Name: name, Interval: true, AutoMerge: true, KeyType: nftables.TypeIPAddr}
+		err = deleteElements(conn, set, intervals(gone))
+		if err == nil {
+			err = addElements(conn, set, intervals(came))
+		}
+		if err == nil {
+			err = conn.Flush()
+		}
+		if err == nil {
+			return nil
+		}
+	}
+	return replaceRanges(name, after, fillLot)
+}
+
+// rangesDiffer returns the ranges of before that after does not have, and those of
+// after that before does not have. Both are in order and do not overlap, as merge makes
+// them: one walk through the two.
+func rangesDiffer(before []netipx.IPRange, after []netipx.IPRange) (gone []netipx.IPRange, came []netipx.IPRange) {
+	for i, j := 0, 0; i < len(before) || j < len(after); {
+		switch {
+		case j == len(after):
+			gone = append(gone, before[i])
+			i++
+		case i == len(before):
+			came = append(came, after[j])
+			j++
+		case before[i] == after[j]:
+			i++
+			j++
+		default:
+			order := before[i].From().Compare(after[j].From())
+			if order <= 0 {
+				gone = append(gone, before[i])
+				i++
+			}
+			if order >= 0 {
+				came = append(came, after[j])
+				j++
+			}
+		}
+	}
+	return gone, came
+}
+
+// merge makes ranges of the IPv4 prefixes, in order: overlapping and adjacent ones become
+// one range. The kernel takes ranges that do not overlap, and the merging the nft program
+// offers ("auto-merge") is done by that program, not by the kernel. The prefixes become
+// pairs of numbers sorted in place: a list of a hundred thousand subnets is merged in a
+// few megabytes, where a set builder allocated a hundred.
+func merge(prefixes []netip.Prefix) []netipx.IPRange {
+	spans := make([][2]uint32, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		if !prefix.Addr().Is4() {
+			continue
+		}
+		prefix = prefix.Masked()
+		address := prefix.Addr().As4()
+		from := binary.BigEndian.Uint32(address[:])
+		spans = append(spans, [2]uint32{from, from | uint32(uint64(1)<<(32-prefix.Bits())-1)})
+	}
+	slices.SortFunc(spans, func(left [2]uint32, right [2]uint32) int { return cmp.Compare(left[0], right[0]) })
+	// merged in place: what is written is behind what is read
+	kept := spans[:0]
+	for _, span := range spans {
+		if last := len(kept) - 1; last >= 0 && (kept[last][1] == math.MaxUint32 || span[0] <= kept[last][1]+1) {
+			kept[last][1] = max(kept[last][1], span[1])
+			continue
+		}
+		kept = append(kept, span)
+	}
+	if len(kept) == 0 {
+		return nil
+	}
+	ranges := make([]netipx.IPRange, len(kept))
+	for index, span := range kept {
+		var from, to [4]byte
+		binary.BigEndian.PutUint32(from[:], span[0])
+		binary.BigEndian.PutUint32(to[:], span[1])
+		ranges[index] = netipx.IPRangeFrom(netip.AddrFrom4(from), netip.AddrFrom4(to))
+	}
+	return ranges
+}
+
+// Apply makes the table anew, in one transaction: what a previous run left is replaced
+// whole, and the kernel never has a half of it.
+func Apply(plan *Plan) error {
+	conn, err := nftables.New()
+	if err != nil {
+		return E.Cause(err, "open netlink")
+	}
+	table := &nftables.Table{Name: tableName, Family: nftables.TableFamilyINet}
+	// a table that is added and deleted in the same transaction: deleting one that is
+	// not there would fail the whole of it
+	conn.AddTable(table)
+	conn.DelTable(table)
+	conn.AddTable(table)
+
+	var builder netipx.IPSetBuilder
+	for _, item := range localRanges {
+		builder.AddRange(item)
+	}
+	local, err := builder.IPSet()
+	if err != nil {
+		return err
+	}
+	localRangesMerged := local.Ranges()
+	nextID := uint32(idInterfaces)
+	// what a set of more than fillLot ranges holds beyond them, added after the table is
+	// there
+	type rest struct {
+		set    *nftables.Set
+		ranges []netipx.IPRange
+	}
+	var later []rest
+	addSet := func(name string, id uint32, ranges []netipx.IPRange) error {
+		set := &nftables.Set{Table: table, ID: id, Name: name, Interval: true, AutoMerge: true, KeyType: nftables.TypeIPAddr}
+		err := conn.AddSet(set, nil)
+		if err != nil {
+			return E.Cause(err, "add the set ", name)
+		}
+		if len(ranges) > fillLot {
+			later = append(later, rest{&nftables.Set{Table: table, Name: name, Interval: true, AutoMerge: true, KeyType: nftables.TypeIPAddr}, ranges[fillLot:]})
+			ranges = ranges[:fillLot]
+		}
+		return addElements(conn, set, intervals(ranges))
+	}
+	err = addSet(SetLocal, idLocal, localRangesMerged)
+	if err != nil {
+		return err
+	}
+	err = addSet(SetSubnets, idSubnets, plan.subnets.of(plan.Subnets))
+	if err != nil {
+		return err
+	}
+	var names []nftables.SetElement
+	for _, name := range plan.Interfaces {
+		// an interval set of names, as the shell backend has it: a name is the range
+		// from itself to the next value
+		names = append(names, nftables.SetElement{Key: interfaceName(name, 0)}, nftables.SetElement{Key: interfaceName(name, 1), IntervalEnd: true})
+	}
+	interfaceSet := &nftables.Set{Table: table, ID: idInterfaces, Name: SetInterfaces, Interval: true, KeyType: nftables.TypeIFName}
+	err = conn.AddSet(interfaceSet, names)
+	if err != nil {
+		return E.Cause(err, "add the set ", SetInterfaces)
+	}
+
+	accept := nftables.ChainPolicyAccept
+	mangle := conn.AddChain(&nftables.Chain{Name: "mangle", Table: table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityMangle, Policy: &accept})
+	mangleOutput := conn.AddChain(&nftables.Chain{Name: "mangle_output", Table: table, Type: nftables.ChainTypeRoute, Hooknum: nftables.ChainHookOutput, Priority: nftables.ChainPriorityMangle, Policy: &accept})
+	proxy := conn.AddChain(&nftables.Chain{Name: "proxy", Table: table, Type: nftables.ChainTypeFilter, Hooknum: nftables.ChainHookPrerouting, Priority: nftables.ChainPriorityNATDest, Policy: &accept})
+	add := func(chain *nftables.Chain, parts ...[]expr.Any) {
+		var all []expr.Any
+		for _, part := range parts {
+			all = append(all, part...)
+		}
+		conn.AddRule(&nftables.Rule{Table: table, Chain: chain, Exprs: all})
+	}
+	fromInterfaces := []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyIIFNAME, Register: 1},
+		&expr.Lookup{SourceRegister: 1, SetName: SetInterfaces, SetID: idInterfaces},
+	}
+	toSubnets := append(ipv4(), addressIn(offsetDestination, SetSubnets, idSubnets)...)
+	toFakeIP := append(ipv4(), addressWithin(offsetDestination, rangeFakeIP)...)
+	mark := []expr.Any{
+		&expr.Immediate{Register: 1, Data: binaryutil.NativeEndian.PutUint32(markProxy)},
+		&expr.Meta{Key: expr.MetaKeyMARK, SourceRegister: true, Register: 1},
+		&expr.Counter{},
+	}
+	returns := []expr.Any{&expr.Verdict{Kind: expr.VerdictReturn}}
+	transports := []byte{unix.IPPROTO_TCP, unix.IPPROTO_UDP}
+
+	// mangle: what comes from the LAN. The shell backend puts the rules of a device on
+	// top of the chain one device after another, so the last device comes first.
+	for index := len(plan.Sources) - 1; index >= 0; index-- {
+		fromDevice := append(ipv4(), addressWithin(offsetSource, plan.Sources[index])...)
+		add(mangle, fromDevice, addressIn(offsetDestination, SetLocal, idLocal), returns)
+		add(mangle, fromInterfaces, fromDevice, protocol(unix.IPPROTO_UDP), mark)
+		add(mangle, fromInterfaces, fromDevice, protocol(unix.IPPROTO_TCP), mark)
+	}
+	if plan.ExcludeNTP {
+		add(mangle, protocol(unix.IPPROTO_UDP), destinationPort(123), returns)
+	}
+	add(mangle, []expr.Any{
+		&expr.Ct{Register: 1, Key: expr.CtKeySTATUS},
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: binaryutil.NativeEndian.PutUint32(statusDNAT), Xor: binaryutil.NativeEndian.PutUint32(0)},
+		&expr.Cmp{Op: expr.CmpOpNeq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(0)},
+	}, returns)
+	for _, destination := range [][]expr.Any{toSubnets, toFakeIP} {
+		for _, transport := range transports {
+			add(mangle, fromInterfaces, destination, protocol(transport), mark)
+		}
+	}
+	// proxy: what is marked goes to the transparent proxy inbound
+	for _, transport := range transports {
+		add(proxy, []expr.Any{
+			&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+			&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: binaryutil.NativeEndian.PutUint32(markProxy), Xor: binaryutil.NativeEndian.PutUint32(0)},
+			&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(markProxy)},
+		}, protocol(transport), []expr.Any{
+			&expr.Immediate{Register: 1, Data: addressProxy.AsSlice()},
+			&expr.Immediate{Register: 2, Data: binaryutil.BigEndian.PutUint16(portTProxy)},
+			&expr.TProxy{Family: byte(nftables.TableFamilyIPv4), TableFamily: byte(nftables.TableFamilyINet), RegAddr: 1, RegPort: 2},
+			&expr.Counter{},
+		})
+	}
+	// mangle_output: the same marking for what the router itself sends
+	// compat: output-mark
+	add(mangleOutput, ipv4(), addressIn(offsetDestination, SetLocal, idLocal), returns)
+	add(mangleOutput, []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyMARK, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.NativeEndian.PutUint32(markOutbound)},
+		&expr.Counter{},
+	}, returns)
+	for _, destination := range [][]expr.Any{toSubnets, toFakeIP} {
+		for _, transport := range transports {
+			add(mangleOutput, destination, protocol(transport), mark)
+		}
+	}
+	// the groups: a set each, and a rule of the LAN chain with the ports of the group
+	for index := range plan.Groups {
+		group := &plan.Groups[index]
+		nextID++
+		groupID := nextID
+		err = addSet(group.Set, groupID, group.prefixes.of(group.Prefixes))
+		if err != nil {
+			return err
+		}
+		var ports []nftables.SetElement
+		for _, item := range group.Ports {
+			ports = append(ports, nftables.SetElement{Key: binaryutil.BigEndian.PutUint16(item.From)})
+			// nothing follows port 65535: such a range has no end element
+			if item.To < 65535 {
+				ports = append(ports, nftables.SetElement{Key: binaryutil.BigEndian.PutUint16(item.To + 1), IntervalEnd: true})
+			}
+		}
+		nextID++
+		portSet := &nftables.Set{Table: table, ID: nextID, Name: "__set%d", Anonymous: true, Constant: true, Interval: true, KeyType: nftables.TypeInetService}
+		err = conn.AddSet(portSet, ports)
+		if err != nil {
+			return E.Cause(err, "add the ports of the set ", group.Set)
+		}
+		add(mangle, fromInterfaces, ipv4(), addressIn(offsetDestination, group.Set, groupID), protocol(group.Protocol), []expr.Any{
+			&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+			&expr.Lookup{SourceRegister: 1, SetName: portSet.Name, SetID: portSet.ID},
+		}, mark)
+	}
+	err = conn.Flush()
+	if err != nil {
+		return E.Cause(err, "apply the table")
+	}
+	for _, item := range later {
+		for len(item.ranges) > 0 {
+			count := min(fillLot, len(item.ranges))
+			err = addElements(conn, item.set, intervals(item.ranges[:count]))
+			if err == nil {
+				err = conn.Flush()
+			}
+			if err != nil {
+				return E.Cause(err, "fill the set ", item.set.Name)
+			}
+			item.ranges = item.ranges[count:]
+		}
+	}
+	return nil
+}
+
+// Remove deletes the table; one that is not there is no error.
+func Remove() error {
+	conn, err := nftables.New()
+	if err != nil {
+		return E.Cause(err, "open netlink")
+	}
+	table := &nftables.Table{Name: tableName, Family: nftables.TableFamilyINet}
+	conn.AddTable(table)
+	conn.DelTable(table)
+	return conn.Flush()
+}
+
+// ReplaceSet makes a set of the table hold exactly these prefixes.
+//
+// With lot zero the set is emptied and filled in one transaction: a packet sees the old
+// set or the new one. A positive lot sends that many ranges a transaction, which bounds
+// what the kernel holds at once at the price of a set that is half filled for a moment.
+// It returns the number of ranges the set holds.
+func ReplaceSet(name string, prefixes []netip.Prefix, lot int) (int, error) {
+	ranges := merge(prefixes)
+	return len(ranges), replaceRanges(name, ranges, lot)
+}
+
+func replaceRanges(name string, ranges []netipx.IPRange, lot int) error {
+	elements := intervals(ranges)
+	conn, err := nftables.New()
+	if err != nil {
+		return E.Cause(err, "open netlink")
+	}
+	set := &nftables.Set{Table: &nftables.Table{Name: tableName, Family: nftables.TableFamilyINet}, Name: name, Interval: true, AutoMerge: true, KeyType: nftables.TypeIPAddr}
+	conn.FlushSet(set)
+	for len(elements) > 0 {
+		count := len(elements)
+		if lot > 0 {
+			count = min(2*lot, count)
+		}
+		err = addElements(conn, set, elements[:count])
+		if err != nil {
+			return err
+		}
+		elements = elements[count:]
+		if len(elements) > 0 {
+			err = conn.Flush()
+			if err != nil {
+				return E.Cause(err, "fill the set ", name)
+			}
+		}
+	}
+	err = conn.Flush()
+	if err != nil {
+		return E.Cause(err, "fill the set ", name)
+	}
+	return nil
+}
+
+// addElements queues the elements of a set. The library puts the elements of a call into
+// one netlink message, and a message holds 64 KiB of them at most: the list is cut here.
+// The messages still belong to one transaction.
+func addElements(conn *nftables.Conn, set *nftables.Set, elements []nftables.SetElement) error {
+	for len(elements) > 0 {
+		count := min(elementsPerMessage, len(elements))
+		err := conn.SetAddElements(set, elements[:count])
+		if err != nil {
+			return E.Cause(err, "add to the set ", set.Name)
+		}
+		elements = elements[count:]
+	}
+	return nil
+}
+
+// deleteElements queues the deletion of elements of a set, as addElements their addition.
+func deleteElements(conn *nftables.Conn, set *nftables.Set, elements []nftables.SetElement) error {
+	for len(elements) > 0 {
+		count := min(elementsPerMessage, len(elements))
+		err := conn.SetDeleteElements(set, elements[:count])
+		if err != nil {
+			return E.Cause(err, "delete from the set ", set.Name)
+		}
+		elements = elements[count:]
+	}
+	return nil
+}
+
+// elementsPerMessage keeps a message of set elements well under the 64 KiB a netlink
+// attribute can be: an element of an IPv4 set takes about twenty bytes.
+const elementsPerMessage = 1000
+
+// intervals writes ranges the way the kernel keeps an interval set: the first address of
+// a range, and the address after its last one marked as an end.
+func intervals(ranges []netipx.IPRange) []nftables.SetElement {
+	elements := make([]nftables.SetElement, 0, 2*len(ranges))
+	for _, item := range ranges {
+		if !item.From().Is4() {
+			continue
+		}
+		elements = append(elements, nftables.SetElement{Key: item.From().AsSlice()})
+		// nothing follows 255.255.255.255: such a range has no end element
+		if end := item.To().Next(); end.IsValid() {
+			elements = append(elements, nftables.SetElement{Key: end.AsSlice(), IntervalEnd: true})
+		}
+	}
+	return elements
+}
+
+// interfaceName is the key of a name in a set of interface names, sixteen bytes, with a
+// number added to it as to one big number.
+func interfaceName(name string, add byte) []byte {
+	key := make([]byte, unix.IFNAMSIZ)
+	copy(key, name)
+	key[len(key)-1] += add
+	return key
+}
+
+func protocol(number byte) []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyL4PROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{number}},
+	}
+}
+
+// where the addresses are in an IPv4 header
+const (
+	offsetSource      = 12
+	offsetDestination = 16
+)
+
+// ipv4 tells the packet is IPv4: the table is of the family inet, and a rule that reads
+// an IPv4 address says so first, once.
+func ipv4() []expr.Any {
+	return []expr.Any{
+		&expr.Meta{Key: expr.MetaKeyNFPROTO, Register: 1},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: []byte{unix.NFPROTO_IPV4}},
+	}
+}
+
+func addressLoad(offset uint32) expr.Any {
+	return &expr.Payload{DestRegister: 1, Base: expr.PayloadBaseNetworkHeader, Offset: offset, Len: 4}
+}
+
+func addressIn(offset uint32, setName string, setID uint32) []expr.Any {
+	return []expr.Any{addressLoad(offset), &expr.Lookup{SourceRegister: 1, SetName: setName, SetID: setID}}
+}
+
+// addressWithin matches an address against a prefix; a whole address needs no mask.
+func addressWithin(offset uint32, prefix netip.Prefix) []expr.Any {
+	if prefix.Bits() == 32 {
+		return []expr.Any{addressLoad(offset), &expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: prefix.Addr().AsSlice()}}
+	}
+	mask := netipx.RangeOfPrefix(netip.PrefixFrom(netip.MustParseAddr("255.255.255.255"), prefix.Bits())).From().AsSlice()
+	return []expr.Any{
+		addressLoad(offset),
+		&expr.Bitwise{SourceRegister: 1, DestRegister: 1, Len: 4, Mask: mask, Xor: []byte{0, 0, 0, 0}},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: prefix.Masked().Addr().AsSlice()},
+	}
+}
+
+func destinationPort(port uint16) []expr.Any {
+	return []expr.Any{
+		&expr.Payload{DestRegister: 1, Base: expr.PayloadBaseTransportHeader, Offset: 2, Len: 2},
+		&expr.Cmp{Op: expr.CmpOpEq, Register: 1, Data: binaryutil.BigEndian.PutUint16(port)},
+	}
+}
+
+// ChainState is what a check wants to know of a chain of the table.
+type ChainState struct {
+	// Exists tells whether the chain is there and has rules that count packets.
+	Exists bool
+	// Counted tells whether any of them has counted a packet.
+	Counted bool
+}
+
+// State is what the kernel has of the table, and what else marks packets.
+type State struct {
+	Table        bool
+	Mangle       ChainState
+	MangleOutput ChainState
+	Proxy        ChainState
+	// ForeignMarks names the chains of other tables that set a packet mark: the place
+	// to look when another program's rules and the backend's get in each other's way.
+	ForeignMarks []string
+}
+
+// Exists tells whether the table is there.
+func Exists() (bool, error) {
+	conn, err := nftables.New()
+	if err != nil {
+		return false, E.Cause(err, "open netlink")
+	}
+	tables, err := conn.ListTables()
+	if err != nil {
+		return false, E.Cause(err, "list the tables")
+	}
+	for _, table := range tables {
+		if table.Family == nftables.TableFamilyINet && table.Name == tableName {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// Inspect reads the state of the table and of the counters of its rules.
+func Inspect() (*State, error) {
+	conn, err := nftables.New()
+	if err != nil {
+		return nil, E.Cause(err, "open netlink")
+	}
+	tables, err := conn.ListTables()
+	if err != nil {
+		return nil, E.Cause(err, "list the tables")
+	}
+	state := new(State)
+	for _, table := range tables {
+		if table.Family == nftables.TableFamilyINet && table.Name == tableName {
+			state.Table = true
+			state.Mangle = chainState(conn, table, "mangle")
+			state.MangleOutput = chainState(conn, table, "mangle_output")
+			state.Proxy = chainState(conn, table, "proxy")
+		}
+	}
+	chains, err := conn.ListChains()
+	if err != nil {
+		return state, E.Cause(err, "list the chains")
+	}
+	for _, chain := range chains {
+		if chain.Table.Family == nftables.TableFamilyINet && chain.Table.Name == tableName {
+			continue
+		}
+		rules, err := conn.GetRules(chain.Table, chain)
+		if err != nil {
+			continue
+		}
+		for _, rule := range rules {
+			if setsMark(rule) {
+				state.ForeignMarks = append(state.ForeignMarks, familyName(chain.Table.Family)+" "+chain.Table.Name+" "+chain.Name)
+				break
+			}
+		}
+	}
+	return state, nil
+}
+
+func chainState(conn *nftables.Conn, table *nftables.Table, name string) ChainState {
+	var state ChainState
+	rules, err := conn.GetRules(table, &nftables.Chain{Name: name, Table: table})
+	if err != nil {
+		return state
+	}
+	for _, rule := range rules {
+		for _, expression := range rule.Exprs {
+			if counter, isCounter := expression.(*expr.Counter); isCounter {
+				state.Exists = true
+				if counter.Packets > 0 || counter.Bytes > 0 {
+					state.Counted = true
+				}
+			}
+		}
+	}
+	return state
+}
+
+func setsMark(rule *nftables.Rule) bool {
+	for _, expression := range rule.Exprs {
+		if meta, isMeta := expression.(*expr.Meta); isMeta && meta.SourceRegister && meta.Key == expr.MetaKeyMARK {
+			return true
+		}
+	}
+	return false
+}
+
+func familyName(family nftables.TableFamily) string {
+	switch family {
+	case nftables.TableFamilyINet:
+		return "inet"
+	case nftables.TableFamilyIPv4:
+		return "ip"
+	case nftables.TableFamilyIPv6:
+		return "ip6"
+	case nftables.TableFamilyBridge:
+		return "bridge"
+	case nftables.TableFamilyARP:
+		return "arp"
+	case nftables.TableFamilyNetdev:
+		return "netdev"
+	}
+	return "family " + strconv.Itoa(int(family))
+}
